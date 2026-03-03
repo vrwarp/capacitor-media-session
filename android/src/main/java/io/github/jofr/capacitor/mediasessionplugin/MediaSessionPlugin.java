@@ -7,11 +7,13 @@ import android.content.ServiceConnection;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.IBinder;
-import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Base64;
 import android.util.Log;
 
 import androidx.core.content.ContextCompat;
+import androidx.media3.common.MediaMetadata;
+import androidx.media3.common.Player;
+import androidx.media3.common.SimpleBasePlayer;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -23,6 +25,7 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -40,7 +43,7 @@ public class MediaSessionPlugin extends Plugin {
     private String title = "";
     private String artist = "";
     private String album = "";
-    private Bitmap artwork = null;
+    private byte[] artworkData = null;
     private String playbackState = "none";
     private double duration = 0.0;
     private double position = 0.0;
@@ -56,9 +59,7 @@ public class MediaSessionPlugin extends Plugin {
             service = binder.getService();
             Intent intent = new Intent(getActivity(), getActivity().getClass());
             service.connectAndInitialize(MediaSessionPlugin.this, intent);
-            updateServiceMetadata();
-            updateServicePlaybackState();
-            updateServicePositionState();
+            updateProxyPlayerState();
         }
 
         @Override
@@ -87,16 +88,14 @@ public class MediaSessionPlugin extends Plugin {
         getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
     }
 
-    private void updateServiceMetadata() {
-        service.setTitle(title);
-        service.setArtist(artist);
-        service.setAlbum(album);
-        service.setArtwork(artwork);
-        service.update();
+    private byte[] bitmapToByteArray(Bitmap bitmap) {
+        if (bitmap == null) return null;
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+        return stream.toByteArray();
     }
 
-
-    private Bitmap urlToBitmap(String url) throws IOException {
+    private byte[] urlToArtworkData(String url) throws IOException {
         final boolean blobUrl = url.startsWith("blob:");
         if (blobUrl) {
             Log.i(TAG, "Converting Blob URLs to Bitmap for media artwork is not yet supported");
@@ -108,17 +107,68 @@ public class MediaSessionPlugin extends Plugin {
             connection.setDoInput(true);
             connection.connect();
             InputStream inputStream = connection.getInputStream();
-            return BitmapFactory.decodeStream(inputStream);
+            Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+            return bitmapToByteArray(bitmap);
         }
 
         int base64Index = url.indexOf(";base64,");
         if (base64Index != -1) {
             String base64Data = url.substring(base64Index + 8);
             byte[] decoded = Base64.decode(base64Data, Base64.DEFAULT);
-            return BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+            Bitmap bitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+            return bitmapToByteArray(bitmap);
         }
 
         return null;
+    }
+
+    private void updateProxyPlayerState() {
+        if (service == null || service.getPlayer() == null) return;
+
+        WebViewProxyPlayer player = service.getPlayer();
+        
+        // 1. Map Playback State
+        int media3State = Player.STATE_READY;
+        boolean isPlaying = false;
+        
+        if (playbackState.equals("playing")) {
+            isPlaying = true;
+        } else if (playbackState.equals("none")) {
+            media3State = Player.STATE_IDLE;
+        }
+
+        // 2. Build Metadata
+        MediaMetadata.Builder metadataBuilder = new MediaMetadata.Builder()
+                .setTitle(title)
+                .setArtist(artist)
+                .setAlbumTitle(album);
+                
+        if (artworkData != null) {
+            metadataBuilder.setArtworkData(artworkData, MediaMetadata.PICTURE_TYPE_FRONT_COVER);
+        }
+
+        // 3. Build available commands based on JS listeners
+        Player.Commands.Builder commandsBuilder = new Player.Commands.Builder();
+        if (hasActionHandler("play") || hasActionHandler("pause")) {
+            commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
+        }
+        if (hasActionHandler("seekto")) {
+            commandsBuilder.add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM);
+        }
+        if (hasActionHandler("seekforward") || hasActionHandler("nexttrack")) {
+            commandsBuilder.add(Player.COMMAND_SEEK_TO_NEXT);
+            commandsBuilder.add(Player.COMMAND_SEEK_FORWARD);
+        }
+        if (hasActionHandler("seekbackward") || hasActionHandler("previoustrack")) {
+            commandsBuilder.add(Player.COMMAND_SEEK_TO_PREVIOUS);
+            commandsBuilder.add(Player.COMMAND_SEEK_BACK);
+        }
+        if (hasActionHandler("stop")) {
+            commandsBuilder.add(Player.COMMAND_STOP);
+        }
+
+        // 4. Invalidate the ProxyPlayer State
+        player.invalidateProxyState();
     }
 
     @PluginMethod
@@ -128,29 +178,18 @@ public class MediaSessionPlugin extends Plugin {
         album = call.getString("album", album);
 
         final JSArray artworkArray = call.getArray("artwork");
-        final List<JSONObject> artworkList = artworkArray.toList();
-        for (JSONObject artwork : artworkList) {
-            String src = artwork.getString("src");
-            if (src != null) {
-                this.artwork = urlToBitmap(src);
+        if (artworkArray != null) {
+            final List<JSONObject> artworkList = artworkArray.toList();
+            for (JSONObject artwork : artworkList) {
+                String src = artwork.getString("src");
+                if (src != null) {
+                    this.artworkData = urlToArtworkData(src);
+                }
             }
         }
 
-        if (service != null) { updateServiceMetadata(); };
+        updateProxyPlayerState();
         call.resolve();
-    }
-
-    private void updateServicePlaybackState() {
-        if (playbackState.equals("playing")) {
-            service.setPlaybackState(PlaybackStateCompat.STATE_PLAYING);
-            service.update();
-        } else if (playbackState.equals("paused")) {
-            service.setPlaybackState(PlaybackStateCompat.STATE_PAUSED);
-            service.update();
-        } else {
-            service.setPlaybackState(PlaybackStateCompat.STATE_NONE);
-            service.update();
-        }
     }
 
     @PluginMethod
@@ -164,17 +203,9 @@ public class MediaSessionPlugin extends Plugin {
             getContext().unbindService(serviceConnection);
             service = null;
         } else if (service != null) {
-            updateServicePlaybackState();
+            updateProxyPlayerState();
         }
         call.resolve();
-    }
-
-    private void updateServicePositionState() {
-        service.setDuration(Math.round(duration * 1000));
-        service.setPosition(Math.round(position * 1000));
-        float playbackSpeed = playbackRate == 0.0 ? (float) 1.0 : (float) playbackRate;
-        service.setPlaybackSpeed(playbackSpeed);
-        service.update();
     }
 
     @PluginMethod
@@ -183,7 +214,7 @@ public class MediaSessionPlugin extends Plugin {
         position = call.getDouble("position", 0.0);
         playbackRate = call.getFloat("playbackRate", 1.0F);
 
-        if (service != null) { updateServicePositionState(); };
+        updateProxyPlayerState();
         call.resolve();
     }
 
@@ -192,7 +223,7 @@ public class MediaSessionPlugin extends Plugin {
         call.setKeepAlive(true);
         actionHandlers.put(call.getString("action"), call);
 
-        if (service != null) { service.updatePossibleActions(); };
+        updateProxyPlayerState();
     }
 
     public boolean hasActionHandler(String action) {
@@ -212,4 +243,14 @@ public class MediaSessionPlugin extends Plugin {
             Log.d(TAG, "No handler for action " + action);
         }
     }
+    
+    // Package-private getters for ProxyPlayer to build its state
+    String getTitle() { return title; }
+    String getArtist() { return artist; }
+    String getAlbum() { return album; }
+    byte[] getArtworkData() { return artworkData; }
+    String getPlaybackState() { return playbackState; }
+    double getDuration() { return duration; }
+    double getPosition() { return position; }
+    double getPlaybackRate() { return playbackRate; }
 }

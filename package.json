@@ -26,6 +26,7 @@
     "native"
   ],
   "scripts": {
+    "test": "docker build -t capacitor-media-session-test . && docker run --rm capacitor-media-session-test",
     "verify": "npm run verify:android && npm run verify:web",
     "verify:android": "cd android && ./gradlew clean build test && cd ..",
     "verify:web": "npm run build",
