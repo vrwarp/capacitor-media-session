@@ -7,10 +7,11 @@ import android.content.ServiceConnection;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.IBinder;
-import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Base64;
 import android.util.Log;
 
+import androidx.media3.common.MediaMetadata;
+import androidx.media3.common.Player;
 import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.JSArray;
@@ -23,6 +24,7 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -59,6 +61,7 @@ public class MediaSessionPlugin extends Plugin {
             updateServiceMetadata();
             updateServicePlaybackState();
             updateServicePositionState();
+            updateAvailableCommands();
         }
 
         @Override
@@ -88,11 +91,22 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     private void updateServiceMetadata() {
-        service.setTitle(title);
-        service.setArtist(artist);
-        service.setAlbum(album);
-        service.setArtwork(artwork);
-        service.update();
+        if (service == null || service.getPlayer() == null) return;
+
+        MediaMetadata.Builder metadataBuilder = new MediaMetadata.Builder()
+                .setTitle(title)
+                .setArtist(artist)
+                .setAlbumTitle(album);
+
+        if (artwork != null) {
+            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+            artwork.compress(Bitmap.CompressFormat.PNG, 100, stream);
+            byte[] byteArray = stream.toByteArray();
+            metadataBuilder.setArtworkData(byteArray, MediaMetadata.PICTURE_TYPE_FRONT_COVER);
+        }
+
+        MediaMetadata metadata = metadataBuilder.build();
+        service.getPlayer().setMetadata(metadata);
     }
 
 
@@ -141,16 +155,20 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     private void updateServicePlaybackState() {
+        if (service == null || service.getPlayer() == null) return;
+
+        int playerState = Player.STATE_IDLE;
+        boolean playWhenReady = false;
+
         if (playbackState.equals("playing")) {
-            service.setPlaybackState(PlaybackStateCompat.STATE_PLAYING);
-            service.update();
+            playerState = Player.STATE_READY;
+            playWhenReady = true;
         } else if (playbackState.equals("paused")) {
-            service.setPlaybackState(PlaybackStateCompat.STATE_PAUSED);
-            service.update();
-        } else {
-            service.setPlaybackState(PlaybackStateCompat.STATE_NONE);
-            service.update();
+            playerState = Player.STATE_READY;
+            playWhenReady = false;
         }
+
+        service.getPlayer().setPlaybackState(playerState, playWhenReady);
     }
 
     @PluginMethod
@@ -170,11 +188,12 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     private void updateServicePositionState() {
-        service.setDuration(Math.round(duration * 1000));
-        service.setPosition(Math.round(position * 1000));
+        if (service == null || service.getPlayer() == null) return;
+
         float playbackSpeed = playbackRate == 0.0 ? (float) 1.0 : (float) playbackRate;
-        service.setPlaybackSpeed(playbackSpeed);
-        service.update();
+        long durationMs = Math.round(duration * 1000);
+        long positionMs = Math.round(position * 1000);
+        service.getPlayer().setPositionState(durationMs, positionMs, playbackSpeed);
     }
 
     @PluginMethod
@@ -192,7 +211,24 @@ public class MediaSessionPlugin extends Plugin {
         call.setKeepAlive(true);
         actionHandlers.put(call.getString("action"), call);
 
-        if (service != null) { service.updatePossibleActions(); };
+        if (service != null && service.getPlayer() != null) {
+            updateAvailableCommands();
+        }
+    }
+
+    private void updateAvailableCommands() {
+        if (service == null || service.getPlayer() == null) return;
+        Player.Commands.Builder commandsBuilder = new Player.Commands.Builder();
+
+        if (hasActionHandler("play")) commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
+        if (hasActionHandler("pause")) commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
+        if (hasActionHandler("seekto")) commandsBuilder.add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM);
+        if (hasActionHandler("seekbackward")) commandsBuilder.add(Player.COMMAND_SEEK_BACK);
+        if (hasActionHandler("seekforward")) commandsBuilder.add(Player.COMMAND_SEEK_FORWARD);
+        if (hasActionHandler("previoustrack")) commandsBuilder.add(Player.COMMAND_SEEK_TO_PREVIOUS);
+        if (hasActionHandler("nexttrack")) commandsBuilder.add(Player.COMMAND_SEEK_TO_NEXT);
+        if (hasActionHandler("stop")) commandsBuilder.add(Player.COMMAND_STOP);
+        service.getPlayer().setAvailableCommands(commandsBuilder.build());
     }
 
     public boolean hasActionHandler(String action) {

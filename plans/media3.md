@@ -201,3 +201,22 @@ Because the Service base class has changed, the service declaration must be upda
     ```
 
 2.  Remove any manual declarations of `MediaButtonReceiver` in the manifest, as Media3 takes over default handling of these broadcast events.
+
+7\. Migration Outcomes & Discoveries
+------------------------------------
+
+The migration to `androidx.media3` was successfully implemented following the proposed architecture. The following actions were completed:
+
+*   **Dependencies:** Updated `android/build.gradle` to use `androidx.media3:media3-session:1.2.0`, `androidx.media3:media3-common:1.2.0`, and included Guava for `ListenableFuture`. Removed legacy `androidx.media` dependency.
+*   **MediaSessionService:** Removed the manual notification builder, MediaStyle, and `MediaButtonReceiver` from `MediaSessionService.java`. Refactored to extend `androidx.media3.session.MediaSessionService` and cleanly bind the new proxy player.
+*   **WebViewProxyPlayer:** Replaced `MediaSessionCallback.java` with a new `WebViewProxyPlayer` extending `SimpleBasePlayer`. Intercepted commands are correctly bridged to JS via `PluginCall` and resolved immediately using `Futures.immediateVoidFuture()`.
+*   **MediaSessionPlugin Sync:** Updated `MediaSessionPlugin.java` to map JS metadata to `androidx.media3.common.MediaMetadata`, convert `Bitmap` artworks to `byte[]` arrays for `setArtworkData`, map JS state to `Player.STATE_READY`, and manage playback positions utilizing `PositionSupplier`.
+*   **Tests:** Fully migrated `MediaSessionPluginTest.java` to evaluate Media3 components, correctly retrieving states using the attached `SimpleBasePlayer`.
+
+### Deviations and Findings
+
+During the implementation, several technical limitations regarding `SimpleBasePlayer.State` required deviations from the initial plan:
+
+1.  **State Instantiation:** In Media3, `SimpleBasePlayer.State` and its builder have restricted access. Consequently, `currentState.buildUpon()` could not be chained directly in the plugin without accessing protected methods. To resolve this, helper methods (`setMetadata`, `setPlaybackState`, `setPositionState`, `setAvailableCommands`) were introduced directly inside `WebViewProxyPlayer` to mutate its internal `State` reference and trigger `invalidateState()`.
+2.  **Playlist Enforcement:** Media3 requires that any `State` referencing an active playback position or metadata must contain a valid playlist. When initializing states (especially for position and playback parameters), an empty playlist would trigger an `IllegalArgumentException`. The code was adjusted to inject a stub `MediaItem` ("WebViewMediaItem") dynamically if the playlist was empty to ensure stability.
+3.  **Unique Session ID:** Within tests, recreating `MediaSessionService` multiple times caused an `IllegalStateException` due to non-unique session IDs. A timestamp-based session ID (`"WebViewMediaSession-" + System.currentTimeMillis()`) was introduced in the `MediaSession.Builder` to safely support rapid lifecycle testing.
