@@ -20,6 +20,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
     }
 
     private ActionCallback actionCallback;
+    private final Object mediaItemUid = new Object();
     private String title = "";
     private String artist = "";
     private String album = "";
@@ -101,7 +102,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
                 .setPlaybackState(media3State)
                 .setPlayWhenReady(isPlaying, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
                 .setPlaylist(java.util.List.of(
-                    new MediaItemData.Builder(new Object())
+                    new MediaItemData.Builder(mediaItemUid)
                         .setMediaMetadata(metadataBuilder.build())
                         .setDurationUs(Math.round(duration * 1000000))
                         .build()
