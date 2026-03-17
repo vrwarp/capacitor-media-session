@@ -167,8 +167,10 @@ public class MediaSessionPlugin extends Plugin {
             commandsBuilder.add(Player.COMMAND_STOP);
         }
 
-        // 4. Invalidate the ProxyPlayer State
-        player.invalidateProxyState();
+        // 4. Invalidate the ProxyPlayer State on the main thread
+        getActivity().runOnUiThread(() -> {
+            player.invalidateProxyState();
+        });
     }
 
     @PluginMethod
