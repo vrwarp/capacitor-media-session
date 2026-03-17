@@ -15,20 +15,50 @@ import com.google.common.util.concurrent.ListenableFuture;
 public class WebViewProxyPlayer extends SimpleBasePlayer {
     private static final String TAG = "WebViewProxyPlayer";
 
-    private final MediaSessionPlugin plugin;
+    public interface ActionCallback {
+        void onAction(String action, com.getcapacitor.JSObject data);
+    }
 
-    public WebViewProxyPlayer(MediaSessionPlugin plugin) {
+    private ActionCallback actionCallback;
+    private String title = "";
+    private String artist = "";
+    private String album = "";
+    private byte[] artworkData = null;
+    private String playbackState = "none";
+    private double duration = 0.0;
+    private double position = 0.0;
+    private double playbackRate = 1.0;
+    private java.util.Set<String> supportedActions = new java.util.HashSet<>();
+
+    public WebViewProxyPlayer() {
         super(android.os.Looper.getMainLooper());
-        this.plugin = plugin;
+    }
+
+    public void setActionCallback(ActionCallback callback) {
+        this.actionCallback = callback;
+    }
+
+    public void updateState(String title, String artist, String album, byte[] artworkData,
+                            String playbackState, double duration, double position,
+                            double playbackRate, java.util.Set<String> supportedActions) {
+        this.title = title;
+        this.artist = artist;
+        this.album = album;
+        this.artworkData = artworkData;
+        this.playbackState = playbackState;
+        this.duration = duration;
+        this.position = position;
+        this.playbackRate = playbackRate;
+        this.supportedActions = supportedActions;
+        invalidateState();
     }
 
     @Override
     protected State getState() {
         // 1. Map Playback State
-        String playbackState = plugin.getPlaybackState();
         int media3State = Player.STATE_READY;
         boolean isPlaying = false;
-        
+
         if ("playing".equals(playbackState)) {
             isPlaying = true;
         } else if ("none".equals(playbackState)) {
@@ -37,32 +67,31 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
         // 2. Build Metadata
         MediaMetadata.Builder metadataBuilder = new MediaMetadata.Builder()
-                .setTitle(plugin.getTitle())
-                .setArtist(plugin.getArtist())
-                .setAlbumTitle(plugin.getAlbum());
-                
-        byte[] artworkData = plugin.getArtworkData();
+                .setTitle(title)
+                .setArtist(artist)
+                .setAlbumTitle(album);
+
         if (artworkData != null) {
             metadataBuilder.setArtworkData(artworkData, MediaMetadata.PICTURE_TYPE_FRONT_COVER);
         }
 
         // 3. Build available commands based on JS listeners
         Player.Commands.Builder commandsBuilder = new Player.Commands.Builder();
-        if (plugin.hasActionHandler("play") || plugin.hasActionHandler("pause")) {
+        if (supportedActions.contains("play") || supportedActions.contains("pause")) {
             commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
         }
-        if (plugin.hasActionHandler("seekto")) {
+        if (supportedActions.contains("seekto")) {
             commandsBuilder.add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM);
         }
-        if (plugin.hasActionHandler("seekforward") || plugin.hasActionHandler("nexttrack")) {
+        if (supportedActions.contains("seekforward") || supportedActions.contains("nexttrack")) {
             commandsBuilder.add(Player.COMMAND_SEEK_TO_NEXT);
             commandsBuilder.add(Player.COMMAND_SEEK_FORWARD);
         }
-        if (plugin.hasActionHandler("seekbackward") || plugin.hasActionHandler("previoustrack")) {
+        if (supportedActions.contains("seekbackward") || supportedActions.contains("previoustrack")) {
             commandsBuilder.add(Player.COMMAND_SEEK_TO_PREVIOUS);
             commandsBuilder.add(Player.COMMAND_SEEK_BACK);
         }
-        if (plugin.hasActionHandler("stop")) {
+        if (supportedActions.contains("stop")) {
             commandsBuilder.add(Player.COMMAND_STOP);
         }
 
@@ -74,11 +103,11 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
                 .setPlaylist(java.util.List.of(
                     new MediaItemData.Builder(new Object())
                         .setMediaMetadata(metadataBuilder.build())
-                        .setDurationUs(Math.round(plugin.getDuration() * 1000000))
+                        .setDurationUs(Math.round(duration * 1000000))
                         .build()
                 ))
-                .setContentPositionMs(Math.round(plugin.getPosition() * 1000))
-                .setPlaybackParameters(new androidx.media3.common.PlaybackParameters((float) plugin.getPlaybackRate()))
+                .setContentPositionMs(Math.round(position * 1000))
+                .setPlaybackParameters(new androidx.media3.common.PlaybackParameters((float) playbackRate))
                 .build();
     }
     public void invalidateProxyState() {
@@ -87,35 +116,37 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     @Override
     protected ListenableFuture<?> handleSetPlayWhenReady(boolean playWhenReady) {
-        if (playWhenReady) {
-            plugin.actionCallback("play");
-        } else {
-            plugin.actionCallback("pause");
+        if (actionCallback != null) {
+            actionCallback.onAction(playWhenReady ? "play" : "pause", new JSObject());
         }
         return Futures.immediateVoidFuture();
     }
 
     @Override
     protected ListenableFuture<?> handleSeek(int mediaItemIndex, long positionMs, @Player.Command int seekCommand) {
-        if (seekCommand == Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM || seekCommand == Player.COMMAND_SEEK_TO_MEDIA_ITEM) {
-            JSObject data = new JSObject();
-            data.put("seekTime", (double) positionMs / 1000.0);
-            plugin.actionCallback("seekto", data);
-        } else if (seekCommand == Player.COMMAND_SEEK_FORWARD) {
-            plugin.actionCallback("seekforward");
-        } else if (seekCommand == Player.COMMAND_SEEK_BACK) {
-            plugin.actionCallback("seekbackward");
-        } else if (seekCommand == Player.COMMAND_SEEK_TO_NEXT || seekCommand == Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM) {
-            plugin.actionCallback("nexttrack");
-        } else if (seekCommand == Player.COMMAND_SEEK_TO_PREVIOUS || seekCommand == Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM) {
-            plugin.actionCallback("previoustrack");
+        if (actionCallback != null) {
+            if (seekCommand == Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM || seekCommand == Player.COMMAND_SEEK_TO_MEDIA_ITEM) {
+                JSObject data = new JSObject();
+                data.put("seekTime", (double) positionMs / 1000.0);
+                actionCallback.onAction("seekto", data);
+            } else if (seekCommand == Player.COMMAND_SEEK_FORWARD) {
+                actionCallback.onAction("seekforward", new JSObject());
+            } else if (seekCommand == Player.COMMAND_SEEK_BACK) {
+                actionCallback.onAction("seekbackward", new JSObject());
+            } else if (seekCommand == Player.COMMAND_SEEK_TO_NEXT || seekCommand == Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM) {
+                actionCallback.onAction("nexttrack", new JSObject());
+            } else if (seekCommand == Player.COMMAND_SEEK_TO_PREVIOUS || seekCommand == Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM) {
+                actionCallback.onAction("previoustrack", new JSObject());
+            }
         }
         return Futures.immediateVoidFuture();
     }
 
     @Override
     protected ListenableFuture<?> handleStop() {
-        plugin.actionCallback("stop");
+        if (actionCallback != null) {
+            actionCallback.onAction("stop", new JSObject());
+        }
         return Futures.immediateVoidFuture();
     }
 }

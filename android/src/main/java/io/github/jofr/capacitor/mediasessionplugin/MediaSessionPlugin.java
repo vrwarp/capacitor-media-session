@@ -57,8 +57,7 @@ public class MediaSessionPlugin extends Plugin {
         public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
             MediaSessionService.LocalBinder binder = (MediaSessionService.LocalBinder) iBinder;
             service = binder.getService();
-            Intent intent = new Intent(getActivity(), getActivity().getClass());
-            service.connectAndInitialize(MediaSessionPlugin.this, intent);
+            service.getPlayer().setActionCallback((action, data) -> actionCallback(action, data));
             updateProxyPlayerState();
         }
 
@@ -125,51 +124,12 @@ public class MediaSessionPlugin extends Plugin {
     private void updateProxyPlayerState() {
         if (service == null || service.getPlayer() == null) return;
 
-        WebViewProxyPlayer player = service.getPlayer();
-        
-        // 1. Map Playback State
-        int media3State = Player.STATE_READY;
-        boolean isPlaying = false;
-        
-        if (playbackState.equals("playing")) {
-            isPlaying = true;
-        } else if (playbackState.equals("none")) {
-            media3State = Player.STATE_IDLE;
-        }
-
-        // 2. Build Metadata
-        MediaMetadata.Builder metadataBuilder = new MediaMetadata.Builder()
-                .setTitle(title)
-                .setArtist(artist)
-                .setAlbumTitle(album);
-                
-        if (artworkData != null) {
-            metadataBuilder.setArtworkData(artworkData, MediaMetadata.PICTURE_TYPE_FRONT_COVER);
-        }
-
-        // 3. Build available commands based on JS listeners
-        Player.Commands.Builder commandsBuilder = new Player.Commands.Builder();
-        if (hasActionHandler("play") || hasActionHandler("pause")) {
-            commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
-        }
-        if (hasActionHandler("seekto")) {
-            commandsBuilder.add(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM);
-        }
-        if (hasActionHandler("seekforward") || hasActionHandler("nexttrack")) {
-            commandsBuilder.add(Player.COMMAND_SEEK_TO_NEXT);
-            commandsBuilder.add(Player.COMMAND_SEEK_FORWARD);
-        }
-        if (hasActionHandler("seekbackward") || hasActionHandler("previoustrack")) {
-            commandsBuilder.add(Player.COMMAND_SEEK_TO_PREVIOUS);
-            commandsBuilder.add(Player.COMMAND_SEEK_BACK);
-        }
-        if (hasActionHandler("stop")) {
-            commandsBuilder.add(Player.COMMAND_STOP);
-        }
-
-        // 4. Invalidate the ProxyPlayer State on the main thread
         getActivity().runOnUiThread(() -> {
-            player.invalidateProxyState();
+            service.getPlayer().updateState(
+                title, artist, album, artworkData,
+                playbackState, duration, position,
+                playbackRate, actionHandlers.keySet()
+            );
         });
     }
 
@@ -199,14 +159,13 @@ public class MediaSessionPlugin extends Plugin {
         playbackState = call.getString("playbackState", playbackState);
 
         final boolean playback = playbackState.equals("playing") || playbackState.equals("paused");
-        if (startServiceOnlyDuringPlayback && service == null && playback) {
+
+        if (service == null && playback) {
             startMediaService();
-        } else if (startServiceOnlyDuringPlayback && service != null && !playback) {
-            getContext().unbindService(serviceConnection);
-            service = null;
         } else if (service != null) {
             updateProxyPlayerState();
         }
+
         call.resolve();
     }
 

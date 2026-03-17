@@ -1,12 +1,10 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
 import android.content.Intent;
-import android.graphics.Bitmap;
 import android.os.Binder;
 import android.os.IBinder;
 
 import androidx.annotation.Nullable;
-import androidx.media3.common.Player;
 import androidx.media3.session.MediaSession;
 
 public class MediaSessionService extends androidx.media3.session.MediaSessionService {
@@ -14,7 +12,6 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
 
     private MediaSession mediaSession;
     private WebViewProxyPlayer player;
-    private MediaSessionPlugin plugin;
 
     private final IBinder binder = new LocalBinder();
 
@@ -22,6 +19,13 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
         MediaSessionService getService() {
             return MediaSessionService.this;
         }
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        this.player = new WebViewProxyPlayer();
+        this.mediaSession = new MediaSession.Builder(this, player).build();
     }
 
     @Nullable
@@ -38,13 +42,6 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     @Override
     public MediaSession onGetSession(MediaSession.ControllerInfo controllerInfo) {
         return mediaSession;
-    }
-
-    public void connectAndInitialize(MediaSessionPlugin plugin, Intent intent) {
-        this.plugin = plugin;
-        this.player = new WebViewProxyPlayer(plugin);
-        
-        mediaSession = new MediaSession.Builder(this, player).build();
     }
 
     @Override
