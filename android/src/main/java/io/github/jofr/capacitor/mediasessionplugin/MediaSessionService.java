@@ -3,6 +3,7 @@ package io.github.jofr.capacitor.mediasessionplugin;
 import android.content.Intent;
 import android.os.Binder;
 import android.os.IBinder;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.media3.session.MediaSession;
@@ -24,6 +25,7 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.i(TAG, "Service onCreate() fired. Building MediaSession.");
         this.player = new WebViewProxyPlayer();
         this.mediaSession = new MediaSession.Builder(this, player).build();
     }
@@ -46,6 +48,7 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
 
     @Override
     public void onDestroy() {
+        Log.i(TAG, "Service onDestroy() fired. Releasing MediaSession.");
         if (mediaSession != null) {
             mediaSession.getPlayer().release();
             mediaSession.release();

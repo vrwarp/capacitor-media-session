@@ -54,6 +54,7 @@ public class MediaSessionPlugin extends Plugin {
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
+            Log.i(TAG, "ServiceConnection: onServiceConnected fired. Binding proxy player.");
             MediaSessionService.LocalBinder binder = (MediaSessionService.LocalBinder) iBinder;
             service = binder.getService();
             service.getPlayer().setActionCallback((action, data) -> actionCallback(action, data));
@@ -62,13 +63,14 @@ public class MediaSessionPlugin extends Plugin {
 
         @Override
         public void onServiceDisconnected(ComponentName componentName) {
-            Log.d(TAG, "Disconnected from MediaSessionService");
+            Log.w(TAG, "ServiceConnection: onServiceDisconnected fired. Service lost.");
         }
     };
 
     @Override
     public void load() {
         super.load();
+        Log.i(TAG, "Plugin load() invoked. startServiceOnlyDuringPlayback: " + startServiceOnlyDuringPlayback);
 
         final String foregroundServiceConfig = getConfig().getString("foregroundService", "");
         if (foregroundServiceConfig.equals("always")) {
@@ -137,6 +139,7 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setMetadata(PluginCall call) throws JSONException, IOException {
+        Log.d(TAG, "JS Bridge -> setMetadata() called: title=" + call.getString("title", "null"));
         title = call.getString("title", title);
         artist = call.getString("artist", artist);
         album = call.getString("album", album);
@@ -152,13 +155,25 @@ public class MediaSessionPlugin extends Plugin {
             }
         }
 
+        if (this.artworkData != null) {
+            int sizeKb = this.artworkData.length / 1024;
+            Log.i(TAG, "Artwork decoded. Size: " + sizeKb + " KB");
+            if (sizeKb > 500) {
+                Log.w(TAG, "WARNING: Artwork size exceeds 500KB. High risk of Binder IPC timeout!");
+            }
+        } else {
+            Log.d(TAG, "No artwork data resolved.");
+        }
+
         updateProxyPlayerState();
         call.resolve();
     }
 
     @PluginMethod
     public void setPlaybackState(PluginCall call) {
-        playbackState = call.getString("playbackState", playbackState);
+        String newState = call.getString("playbackState", playbackState);
+        Log.d(TAG, "JS Bridge -> setPlaybackState() called. New state: " + newState + " | Old state: " + playbackState);
+        playbackState = newState;
 
         final boolean playback = playbackState.equals("playing") || playbackState.equals("paused");
 
@@ -173,6 +188,7 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setPositionState(PluginCall call) {
+        Log.d(TAG, "JS Bridge -> setPositionState() called. Position: " + call.getDouble("position", 0.0));
         duration = call.getDouble("duration", 0.0);
         position = call.getDouble("position", 0.0);
         playbackRate = call.getFloat("playbackRate", 1.0F);
@@ -200,6 +216,7 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     public void actionCallback(String action, JSObject data) {
+        Log.i(TAG, "Native -> JS Bridge: Emitting onMediaAction -> " + action);
         if (supportedActions.contains(action)) {
             data.put("action", action);
             notifyListeners("onMediaAction", data);

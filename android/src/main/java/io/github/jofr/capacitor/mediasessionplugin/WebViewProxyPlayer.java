@@ -42,6 +42,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
     public void updateState(String title, String artist, String album, byte[] artworkData,
                             String playbackState, double duration, double position,
                             double playbackRate, java.util.Set<String> supportedActions) {
+        Log.d(TAG, "updateState() called. playbackState: " + playbackState + ", title: " + title);
         this.title = title;
         this.artist = artist;
         this.album = album;
@@ -51,11 +52,12 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         this.position = position;
         this.playbackRate = playbackRate;
         this.supportedActions = supportedActions;
-        invalidateState();
+        invalidateState(); // Forces Media3 to call getState()
     }
 
     @Override
     protected State getState() {
+        Log.d(TAG, "Media3 framework invoking getState(). Constructing state with playbackState=" + playbackState);
         // 1. Map Playback State
         int media3State = Player.STATE_READY;
         boolean isPlaying = false;
@@ -124,6 +126,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     @Override
     protected ListenableFuture<?> handleSetPlayWhenReady(boolean playWhenReady) {
+        Log.i(TAG, "OS -> Player: handleSetPlayWhenReady(" + playWhenReady + ")");
         // Optimistically update internal state to prevent UI snapping back
         this.playbackState = playWhenReady ? "playing" : "paused";
         invalidateState(); // Force Media3 to read the new state immediately
@@ -136,6 +139,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     @Override
     protected ListenableFuture<?> handleSeek(int mediaItemIndex, long positionMs, @Player.Command int seekCommand) {
+        Log.i(TAG, "OS -> Player: handleSeek(positionMs=" + positionMs + ", command=" + seekCommand + ")");
         if (actionCallback != null) {
             if (seekCommand == Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM || seekCommand == Player.COMMAND_SEEK_TO_MEDIA_ITEM) {
                 JSObject data = new JSObject();
@@ -156,6 +160,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     @Override
     protected ListenableFuture<?> handleStop() {
+        Log.i(TAG, "OS -> Player: handleStop()");
         if (actionCallback != null) {
             actionCallback.onAction("stop", new JSObject());
         }
