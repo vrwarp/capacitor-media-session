@@ -78,6 +78,13 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
         // 3. Build available commands based on JS listeners
         Player.Commands.Builder commandsBuilder = new Player.Commands.Builder();
+
+        // Add REQUIRED foundational commands for System UI to recognize the player properly
+        commandsBuilder.add(Player.COMMAND_GET_CURRENT_MEDIA_ITEM);
+        commandsBuilder.add(Player.COMMAND_GET_METADATA);
+        commandsBuilder.add(Player.COMMAND_GET_TIMELINE);
+        commandsBuilder.add(Player.COMMAND_GET_DEVICE_VOLUME);
+
         if (supportedActions.contains("play") || supportedActions.contains("pause")) {
             commandsBuilder.add(Player.COMMAND_PLAY_PAUSE);
         }
@@ -117,6 +124,10 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     @Override
     protected ListenableFuture<?> handleSetPlayWhenReady(boolean playWhenReady) {
+        // Optimistically update internal state to prevent UI snapping back
+        this.playbackState = playWhenReady ? "playing" : "paused";
+        invalidateState(); // Force Media3 to read the new state immediately
+
         if (actionCallback != null) {
             actionCallback.onAction(playWhenReady ? "play" : "pause", new JSObject());
         }

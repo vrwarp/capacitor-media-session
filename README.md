@@ -34,6 +34,7 @@ __There is one notable difference compared to the Web API__: You have to explici
 * [`setPlaybackState(...)`](#setplaybackstate)
 * [`setActionHandler(...)`](#setactionhandler)
 * [`setPositionState(...)`](#setpositionstate)
+* [`addListener('onMediaAction', ...)`](#addlisteneronmediaaction)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
 
@@ -81,19 +82,14 @@ when using the Media Session API directly.
 ### setActionHandler(...)
 
 ```typescript
-setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null) => Promise<void>
+setActionHandler(options: ActionHandlerOptions) => Promise<void>
 ```
 
-Sets handler for media session actions (e.g. initiated via onscreen media
-controls or physical buttons). Analogue to calling [setActionHandler() of
-the MediaSession
-interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler)
-when using the Media Session API directly.
+Registers an intent to handle a specific action.
 
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |
 | **`options`** | <code><a href="#actionhandleroptions">ActionHandlerOptions</a></code> |
-| **`handler`** | <code><a href="#actionhandler">ActionHandler</a> \| null</code>       |
 
 --------------------
 
@@ -112,6 +108,24 @@ when using the Media Session API directly.
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |
 | **`options`** | <code><a href="#positionstateoptions">PositionStateOptions</a></code> |
+
+--------------------
+
+
+### addListener('onMediaAction', ...)
+
+```typescript
+addListener(eventName: 'onMediaAction', listenerFunc: ActionHandler) => Promise<PluginListenerHandle>
+```
+
+Listen for media actions from the OS
+
+| Param              | Type                                                    |
+| ------------------ | ------------------------------------------------------- |
+| **`eventName`**    | <code>'onMediaAction'</code>                            |
+| **`listenerFunc`** | <code><a href="#actionhandler">ActionHandler</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
 
 --------------------
 
@@ -143,14 +157,6 @@ when using the Media Session API directly.
 | **`action`** | <code>MediaSessionAction</code> |
 
 
-#### ActionDetails
-
-| Prop           | Type                            |
-| -------------- | ------------------------------- |
-| **`action`**   | <code>MediaSessionAction</code> |
-| **`seekTime`** | <code>number \| null</code>     |
-
-
 #### PositionStateOptions
 
 | Prop               | Type                |
@@ -158,6 +164,21 @@ when using the Media Session API directly.
 | **`duration`**     | <code>number</code> |
 | **`playbackRate`** | <code>number</code> |
 | **`position`**     | <code>number</code> |
+
+
+#### PluginListenerHandle
+
+| Prop         | Type                                      |
+| ------------ | ----------------------------------------- |
+| **`remove`** | <code>() =&gt; Promise&lt;void&gt;</code> |
+
+
+#### ActionDetails
+
+| Prop           | Type                            |
+| -------------- | ------------------------------- |
+| **`action`**   | <code>MediaSessionAction</code> |
+| **`seekTime`** | <code>number \| null</code>     |
 
 
 ### Type Aliases

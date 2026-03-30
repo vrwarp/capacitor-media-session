@@ -10,7 +10,6 @@ import android.os.IBinder;
 import android.util.Base64;
 import android.util.Log;
 
-import androidx.core.content.ContextCompat;
 import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.Player;
 import androidx.media3.common.SimpleBasePlayer;
@@ -30,9 +29,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 
 @CapacitorPlugin(name = "MediaSession")
 public class MediaSessionPlugin extends Plugin {
@@ -48,7 +47,7 @@ public class MediaSessionPlugin extends Plugin {
     private double duration = 0.0;
     private double position = 0.0;
     private double playbackRate = 1.0;
-    private final Map<String, PluginCall> actionHandlers = new HashMap<>();
+    private final Set<String> supportedActions = new HashSet<>();
 
     private MediaSessionService service = null;
 
@@ -83,7 +82,6 @@ public class MediaSessionPlugin extends Plugin {
 
     public void startMediaService() {
         Intent intent = new Intent(getActivity(), MediaSessionService.class);
-        ContextCompat.startForegroundService(getContext(), intent);
         getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
     }
 
@@ -103,11 +101,15 @@ public class MediaSessionPlugin extends Plugin {
         final boolean httpUrl = url.startsWith("http");
         if (httpUrl) {
             HttpURLConnection connection = (HttpURLConnection) (new URL(url)).openConnection();
+            connection.setConnectTimeout(3000); // 3 seconds
+            connection.setReadTimeout(3000);    // 3 seconds
             connection.setDoInput(true);
             connection.connect();
-            InputStream inputStream = connection.getInputStream();
-            Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
-            return bitmapToByteArray(bitmap);
+
+            try (InputStream inputStream = connection.getInputStream()) {
+                Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+                return bitmapToByteArray(bitmap);
+            }
         }
 
         int base64Index = url.indexOf(";base64,");
@@ -128,7 +130,7 @@ public class MediaSessionPlugin extends Plugin {
             service.getPlayer().updateState(
                 title, artist, album, artworkData,
                 playbackState, duration, position,
-                playbackRate, actionHandlers.keySet()
+                playbackRate, supportedActions
             );
         });
     }
@@ -179,16 +181,18 @@ public class MediaSessionPlugin extends Plugin {
         call.resolve();
     }
 
-    @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
+    @PluginMethod
     public void setActionHandler(PluginCall call) {
-        call.setKeepAlive(true);
-        actionHandlers.put(call.getString("action"), call);
-
-        updateProxyPlayerState();
+        String action = call.getString("action");
+        if (action != null) {
+            supportedActions.add(action);
+            updateProxyPlayerState();
+        }
+        call.resolve();
     }
 
     public boolean hasActionHandler(String action) {
-        return actionHandlers.containsKey(action) && !actionHandlers.get(action).getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING);
+        return supportedActions.contains(action);
     }
 
     public void actionCallback(String action) {
@@ -196,13 +200,25 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     public void actionCallback(String action, JSObject data) {
-        PluginCall call = actionHandlers.get(action);
-        if (call != null && !call.getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING)) {
+        if (supportedActions.contains(action)) {
             data.put("action", action);
-            call.resolve(data);
+            notifyListeners("onMediaAction", data);
         } else {
-            Log.d(TAG, "No handler for action " + action);
+            Log.d(TAG, "No handler registered for action " + action);
         }
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (service != null) {
+            try {
+                getContext().unbindService(serviceConnection);
+            } catch (IllegalArgumentException e) {
+                // Ignored: Service was not registered
+            }
+            service = null;
+        }
+        super.handleOnDestroy();
     }
     
     // Package-private getters for ProxyPlayer to build its state

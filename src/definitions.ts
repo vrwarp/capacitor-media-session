@@ -1,3 +1,5 @@
+import type { PluginListenerHandle } from '@capacitor/core';
+
 export interface MetadataOptions {
     album?: string;
     artist?: string;
@@ -15,7 +17,7 @@ export interface ActionHandlerOptions {
 
 export type ActionHandler = (details: ActionDetails) => void;
 
-interface ActionDetails {
+export interface ActionDetails {
     action: MediaSessionAction;
     seekTime?: number | null;
 }
@@ -41,14 +43,8 @@ export interface MediaSessionPlugin {
      * when using the Media Session API directly.
      */
     setPlaybackState(options: PlaybackStateOptions): Promise<void>;
-    /**
-     * Sets handler for media session actions (e.g. initiated via onscreen media
-     * controls or physical buttons). Analogue to calling [setActionHandler() of
-     * the MediaSession
-     * interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler)
-     * when using the Media Session API directly.
-     */
-    setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void>;
+    /** Registers an intent to handle a specific action. */
+    setActionHandler(options: ActionHandlerOptions): Promise<void>;
     /**
      * Update current media playback position, duration and speed. Analogue to
      * calling [setPositionState() of the MediaSession
@@ -56,4 +52,9 @@ export interface MediaSessionPlugin {
      * when using the Media Session API directly.
      */
     setPositionState(options: PositionStateOptions): Promise<void>;
+    /** Listen for media actions from the OS */
+    addListener(
+        eventName: 'onMediaAction',
+        listenerFunc: ActionHandler
+    ): Promise<PluginListenerHandle>;
 }

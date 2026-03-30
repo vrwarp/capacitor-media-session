@@ -1,11 +1,12 @@
 import { WebPlugin } from '@capacitor/core';
 
-import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, ActionHandler, PositionStateOptions, MediaSessionPlugin } from './definitions';
+import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, PositionStateOptions, MediaSessionPlugin, ActionHandler } from './definitions';
+import type { PluginListenerHandle } from '@capacitor/core';
 
 export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
     async setMetadata(options: MetadataOptions): Promise<void> {
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.metadata = new MediaMetadata(options);
+            navigator.mediaSession.metadata = new MediaMetadata(options as any);
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }
@@ -19,9 +20,11 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         }
     };
 
-    async setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void> {
+    async setActionHandler(options: ActionHandlerOptions): Promise<void> {
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.setActionHandler(options.action, handler);
+            navigator.mediaSession.setActionHandler(options.action, (details) => {
+                this.notifyListeners('onMediaAction', details);
+            });
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }
@@ -34,4 +37,11 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
             throw this.unavailable('Media Session API not available in this browser.');
         }
     };
+
+    addListener(
+        eventName: 'onMediaAction',
+        listenerFunc: ActionHandler
+    ): Promise<PluginListenerHandle> {
+        return super.addListener(eventName, listenerFunc);
+    }
 }
