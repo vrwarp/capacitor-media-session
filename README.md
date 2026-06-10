@@ -11,7 +11,7 @@ Another problem with audio playback (using web standards, e.g. an `<audio>` elem
 
 ## Install
 
-If you are using Capacitor 6 just install the latest 4.x version of this plugin using
+If you are using Capacitor 6 or 7 just install the latest 4.x version of this plugin using
 
 ```bash
 npm install @jofr/capacitor-media-session
@@ -19,6 +19,10 @@ npx cap sync
 ```
 
 For Capacitor 5 you can install the 3.x version (`npm install @jofr/capacitor-media-session@3`) instead, for Capacitor 4 you can install the 2.x version of this plugin (`npm install @jofr/capacitor-media-session@2`) and for Capacitor 3 the 1.x version of this plugin (`npm install @jofr/capacitor-media-session@1`).
+
+### Android
+
+The Android implementation is built on [AndroidX Media3](https://developer.android.com/media/media3): the plugin hosts an `androidx.media3.session.MediaSessionService` with a proxy `Player` that mirrors the playback state of the WebView, and Media3 takes care of the media notification, lock screen and Bluetooth controls, hardware media keys and the foreground service lifecycle. The plugin manifest already requests the `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_MEDIA_PLAYBACK` permissions (the latter is required since Android 14), so no additional setup is needed in your app.
 
 ## Usage
 
@@ -145,10 +149,11 @@ when using the Media Session API directly.
 
 #### ActionDetails
 
-| Prop           | Type                            |
-| -------------- | ------------------------------- |
-| **`action`**   | <code>MediaSessionAction</code> |
-| **`seekTime`** | <code>number \| null</code>     |
+| Prop             | Type                            |
+| ---------------- | ------------------------------- |
+| **`action`**     | <code>MediaSessionAction</code> |
+| **`seekOffset`** | <code>number \| null</code>     |
+| **`seekTime`**   | <code>number \| null</code>     |
 
 
 #### PositionStateOptions

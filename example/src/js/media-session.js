@@ -1,68 +1,87 @@
 import { MediaSession } from '@jofr/capacitor-media-session';
 
-const audioElement = document.querySelector('audio');
-let playbackStopped = true;
+export const TRACK_METADATA = {
+    title: 'Prelude',
+    artist: 'Jan Morgenstern',
+    album: 'Big Buck Bunny',
+    artwork: [
+        { src: './assets/imgs/logo.png', type: 'image/png', sizes: '512x512' }
+    ]
+};
 
-const updatePositionState = () => {
-    MediaSession.setPositionState({
-        position: audioElement.currentTime,
-        duration: audioElement.duration,
-        playbackRate: audioElement.playbackRate
+/**
+ * Wires an audio element to the Media Session plugin: keeps playback, position
+ * and metadata state in sync and registers handlers for all media actions.
+ */
+export function setupMediaSession(audioElement) {
+    let playbackStopped = true;
+
+    const updatePositionState = () => {
+        MediaSession.setPositionState({
+            position: audioElement.currentTime || 0,
+            duration: Number.isFinite(audioElement.duration) ? audioElement.duration : 0,
+            playbackRate: audioElement.playbackRate || 1
+        });
+    };
+
+    const updatePlaybackState = () => {
+        const playbackState = playbackStopped ? 'none' : (audioElement.paused ? 'paused' : 'playing');
+        MediaSession.setPlaybackState({ playbackState });
+    };
+
+    audioElement.addEventListener('durationchange', updatePositionState);
+    audioElement.addEventListener('seeked', updatePositionState);
+    audioElement.addEventListener('ratechange', updatePositionState);
+    audioElement.addEventListener('play', updatePositionState);
+    audioElement.addEventListener('pause', updatePositionState);
+
+    audioElement.addEventListener('play', () => {
+        playbackStopped = false;
+        updatePlaybackState();
+        MediaSession.setMetadata(TRACK_METADATA);
+    });
+    audioElement.addEventListener('pause', updatePlaybackState);
+    audioElement.addEventListener('ended', () => {
+        playbackStopped = true;
+        updatePlaybackState();
+    });
+
+    MediaSession.setActionHandler({ action: 'play' }, () => {
+        audioElement.play();
+    });
+
+    MediaSession.setActionHandler({ action: 'pause' }, () => {
+        audioElement.pause();
+    });
+
+    MediaSession.setActionHandler({ action: 'seekto' }, (details) => {
+        audioElement.currentTime = details.seekTime;
+    });
+
+    MediaSession.setActionHandler({ action: 'seekforward' }, (details) => {
+        const seekOffset = details.seekOffset ?? 30;
+        audioElement.currentTime = audioElement.currentTime + seekOffset;
+    });
+
+    MediaSession.setActionHandler({ action: 'seekbackward' }, (details) => {
+        const seekOffset = details.seekOffset ?? 30;
+        audioElement.currentTime = Math.max(0, audioElement.currentTime - seekOffset);
+    });
+
+    // The example only has a single track, so "previous"/"next" both restart it.
+    // They are registered anyway so that the corresponding buttons show up in
+    // the system media controls and can be tested.
+    MediaSession.setActionHandler({ action: 'previoustrack' }, () => {
+        audioElement.currentTime = 0;
+    });
+
+    MediaSession.setActionHandler({ action: 'nexttrack' }, () => {
+        audioElement.currentTime = 0;
+    });
+
+    MediaSession.setActionHandler({ action: 'stop' }, () => {
+        playbackStopped = true;
+        audioElement.pause();
+        updatePlaybackState();
     });
 }
-
-audioElement.addEventListener('durationchange', updatePositionState);
-audioElement.addEventListener('seeked', updatePositionState);
-audioElement.addEventListener('ratechange', updatePositionState);
-audioElement.addEventListener('play', updatePositionState);
-audioElement.addEventListener('pause', updatePositionState);
-
-const updatePlaybackState = () => {
-    const playbackState = playbackStopped ? 'none' : (audioElement.paused ? 'paused' : 'playing');
-    MediaSession.setPlaybackState({
-        playbackState: playbackState
-    });
-}
-
-audioElement.addEventListener('play', () => {
-    playbackStopped = false;
-    updatePlaybackState();
-
-    MediaSession.setMetadata({
-        title: 'Prelude',
-        artist: 'Jan Morgenstern',
-        album: 'Big Buck Bunny',
-        artwork: [
-            { src: './assets/imgs/logo.png', type: 'image/png', sizes: '512x512' }
-        ]
-    });
-});
-audioElement.addEventListener('pause', updatePlaybackState);
-
-
-MediaSession.setActionHandler({ action: 'play' }, () => {
-    audioElement.play();
-});
-
-MediaSession.setActionHandler({ action: 'pause' }, () => {
-    audioElement.pause();
-});
-
-MediaSession.setActionHandler({ action: 'seekto' }, (details) => {
-    audioElement.currentTime = details.seekTime;
-});
-
-MediaSession.setActionHandler({ action: 'seekforward' }, (details) => {
-    const seekOffset = details.seekOffset ?? 30;
-    audioElement.currentTime = audioElement.currentTime + seekOffset;
-});
-
-MediaSession.setActionHandler({ action: 'seekbackward' }, (details) => {
-    const seekOffset = details.seekOffset ?? 30;
-    audioElement.currentTime = audioElement.currentTime - 30;
-});
-
-MediaSession.setActionHandler({ action: 'stop' }, () => {
-    playbackStopped = true;
-    audioElement.pause();
-});

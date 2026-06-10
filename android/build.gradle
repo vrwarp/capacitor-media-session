@@ -3,6 +3,7 @@ ext {
     androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.6.1'
     androidxJunitVersion = project.hasProperty('androidxJunitVersion') ? rootProject.ext.androidxJunitVersion : '1.1.5'
     androidxEspressoCoreVersion = project.hasProperty('androidxEspressoCoreVersion') ? rootProject.ext.androidxEspressoCoreVersion : '3.5.1'
+    androidxMedia3Version = project.hasProperty('androidxMedia3Version') ? rootProject.ext.androidxMedia3Version : '1.4.1'
 }
 
 buildscript {
@@ -11,7 +12,7 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.2.1'
+        classpath 'com.android.tools.build:gradle:8.7.2'
     }
 }
 
@@ -40,6 +41,17 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            all {
+                testLogging {
+                    events "passed", "skipped", "failed"
+                    exceptionFormat "full"
+                }
+            }
+        }
+    }
 }
 
 repositories {
@@ -53,12 +65,13 @@ dependencies {
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
 
-    implementation "androidx.media:media:1.6.0"
+    implementation "androidx.media3:media3-session:$androidxMedia3Version"
+    implementation "androidx.media3:media3-common:$androidxMedia3Version"
+
     testImplementation "junit:junit:$junitVersion"
-    testImplementation "org.mockito:mockito-core:4.11.0"
-    testImplementation "org.json:json:20240303"
-    testImplementation "org.robolectric:robolectric:4.11.1"
+    testImplementation "org.mockito:mockito-core:5.14.2"
+    testImplementation "org.robolectric:robolectric:4.14.1"
+    testImplementation "androidx.test:core:1.6.1"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
 }
-
