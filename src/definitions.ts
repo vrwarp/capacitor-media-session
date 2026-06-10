@@ -15,8 +15,9 @@ export interface ActionHandlerOptions {
 
 export type ActionHandler = (details: ActionDetails) => void;
 
-interface ActionDetails {
+export interface ActionDetails {
     action: MediaSessionAction;
+    seekOffset?: number | null;
     seekTime?: number | null;
 }
 

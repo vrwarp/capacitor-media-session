@@ -1,189 +1,383 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
-import static org.mockito.Mockito.*;
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyFloat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.robolectric.Shadows.shadowOf;
 
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
-import android.support.v4.media.MediaMetadataCompat;
-import android.support.v4.media.session.MediaControllerCompat;
-import android.support.v4.media.session.MediaSessionCompat;
-import android.support.v4.media.session.PlaybackStateCompat;
+import android.content.ServiceConnection;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.os.IBinder;
+import android.os.Looper;
+import android.util.Base64;
 
+import androidx.media3.common.MediaMetadata;
+import androidx.media3.common.Player;
+import androidx.test.core.app.ApplicationProvider;
+
+import com.getcapacitor.Bridge;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PluginCall;
-import com.getcapacitor.Bridge;
-import androidx.appcompat.app.AppCompatActivity;
 
 import org.json.JSONException;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
+import org.robolectric.android.controller.ServiceController;
 import org.robolectric.annotation.Config;
 
-import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Field;
-import android.content.ComponentName;
 
+/**
+ * Functional tests for the Capacitor plugin: plugin calls must be reflected in the Media3 proxy
+ * player and player commands must resolve the registered action handler calls.
+ */
 @RunWith(RobolectricTestRunner.class)
-@Config(manifest=Config.NONE)
+@Config(sdk = 34)
 public class MediaSessionPluginTest {
-
     private MediaSessionPlugin plugin;
-    private Bridge mockBridge;
-    private AppCompatActivity mockActivity;
-    private MediaSessionService realService;
-    private MediaControllerCompat controller;
+    private ServiceController<MediaSessionService> serviceController;
+    private MediaSessionService service;
+    private WebViewProxyPlayer player;
 
     @Before
     public void setUp() throws Exception {
+        Context context = ApplicationProvider.getApplicationContext();
+
         plugin = new MediaSessionPlugin();
-        mockBridge = mock(Bridge.class);
-        mockActivity = mock(AppCompatActivity.class);
-        when(mockBridge.getActivity()).thenReturn(mockActivity);
-        when(mockBridge.getContext()).thenReturn(mockActivity);
-        plugin.setBridge(mockBridge);
+        Bridge bridge = mock(Bridge.class);
+        when(bridge.getContext()).thenReturn(context);
+        plugin.setBridge(bridge);
 
-        // Setup real MediaSessionService using Robolectric
-        realService = Robolectric.setupService(MediaSessionService.class);
-        Intent intent = new Intent(mockActivity, mockActivity.getClass());
+        serviceController = Robolectric.buildService(MediaSessionService.class).create();
+        service = serviceController.get();
+        player = service.getPlayer();
 
-        // MediaSessionCompat requires a valid context to resolve a MediaButtonReceiver.
-        // Robolectric's mocked Application context can't resolve it directly out of the box
-        // if the AndroidManifest isn't parsed in a certain way, so we provide an explicit application context.
-        // Actually, MediaSessionCompat needs the manifest to contain a MediaButtonReceiver.
-        // Since this is a library, the manifest might not be fully parsed.
-        // Let's use Robolectric's shadow capabilities or just avoid connectAndInitialize crashing by catching.
-        // Or we can mock the Service intent and try wrapping context.
+        // Connect the plugin to the service the same way Android would after bindService():
+        // through the local binder handed out for intents without an action.
+        IBinder binder = service.onBind(new Intent(context, MediaSessionService.class));
+        ServiceConnection connection = getServiceConnection();
+        connection.onServiceConnected(new ComponentName(context, MediaSessionService.class), binder);
+        idleMainLooper();
+    }
 
-        // Actually, in Robolectric, a common workaround for MediaSessionCompat is to use:
-        // RobolectricTestRunner with @Config(manifest=Config.NONE) or provide a fake manifest.
-        // Let's just catch and ignore, but wait, if it crashes we can't test it.
-        // Let's spy realService or we just use `Robolectric.buildService()`
-        realService = Robolectric.buildService(MediaSessionService.class).create().get();
-        try {
-            realService.connectAndInitialize(plugin, intent);
-        } catch (IllegalArgumentException e) {
-            // Robolectric throws MediaButtonReceiver component may not be null.
-            // In Android X / Support Library, MediaSessionCompat tries to find MediaButtonReceiver in Manifest
-            // If it can't, it throws. Let's explicitly setup the MediaSessionCompat via reflection to bypass this.
-            // We can just create a dummy MediaSessionCompat and inject it into realService.
-
-            ComponentName mockComponent = new ComponentName(org.robolectric.RuntimeEnvironment.getApplication(), "MockReceiver");
-            MediaSessionCompat dummySession = new MediaSessionCompat(org.robolectric.RuntimeEnvironment.getApplication(), "TestSession", mockComponent, null);
-            Field mediaSessionField = MediaSessionService.class.getDeclaredField("mediaSession");
-            mediaSessionField.setAccessible(true);
-            mediaSessionField.set(realService, dummySession);
-
-            // Re-run the rest of the initialization that would normally happen.
-            Field playbackStateBuilderField = MediaSessionService.class.getDeclaredField("playbackStateBuilder");
-            playbackStateBuilderField.setAccessible(true);
-            playbackStateBuilderField.set(realService, new PlaybackStateCompat.Builder()
-                .setActions(PlaybackStateCompat.ACTION_PLAY)
-                .setState(PlaybackStateCompat.STATE_PAUSED, 0, 1.0F));
-            dummySession.setPlaybackState((PlaybackStateCompat) ((PlaybackStateCompat.Builder)playbackStateBuilderField.get(realService)).build());
-
-            Field mediaMetadataBuilderField = MediaSessionService.class.getDeclaredField("mediaMetadataBuilder");
-            mediaMetadataBuilderField.setAccessible(true);
-            mediaMetadataBuilderField.set(realService, new MediaMetadataCompat.Builder().putLong(MediaMetadataCompat.METADATA_KEY_DURATION, 0));
-            dummySession.setMetadata(((MediaMetadataCompat.Builder)mediaMetadataBuilderField.get(realService)).build());
-
-            Field pluginField = MediaSessionService.class.getDeclaredField("plugin");
-            pluginField.setAccessible(true);
-            pluginField.set(realService, plugin);
+    @After
+    public void tearDown() {
+        if (serviceController != null) {
+            serviceController.destroy();
+            serviceController = null;
         }
+    }
 
-        // Inject real service into plugin
-        Field serviceField = MediaSessionPlugin.class.getDeclaredField("service");
-        serviceField.setAccessible(true);
-        serviceField.set(plugin, realService);
+    private ServiceConnection getServiceConnection() throws Exception {
+        Field field = MediaSessionPlugin.class.getDeclaredField("serviceConnection");
+        field.setAccessible(true);
+        return (ServiceConnection) field.get(plugin);
+    }
 
-        // Access the MediaSessionCompat instance from the service to build a MediaController
-        Field mediaSessionField = MediaSessionService.class.getDeclaredField("mediaSession");
-        mediaSessionField.setAccessible(true);
-        MediaSessionCompat mediaSession = (MediaSessionCompat) mediaSessionField.get(realService);
+    private Object getPluginField(String name) throws Exception {
+        Field field = MediaSessionPlugin.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(plugin);
+    }
 
-        controller = new MediaControllerCompat(mockActivity, mediaSession.getSessionToken());
+    private void setPluginField(String name, Object value) throws Exception {
+        Field field = MediaSessionPlugin.class.getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(plugin, value);
+    }
+
+    private static void idleMainLooper() {
+        shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    private PluginCall mockActionHandlerCall(String action) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("action")).thenReturn(action);
+        when(call.getCallbackId()).thenReturn("callback-" + action);
+        return call;
+    }
+
+    private void registerActionHandlers(String... actions) {
+        for (String action : actions) {
+            plugin.setActionHandler(mockActionHandlerCall(action));
+        }
+        idleMainLooper();
+    }
+
+    private void setPlaybackState(String state) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString(eq("playbackState"), anyString())).thenReturn(state);
+        plugin.setPlaybackState(call);
+        idleMainLooper();
     }
 
     @Test
-    public void testSetMetadataPropagatesToMediaSession() throws JSONException, IOException {
+    public void setMetadataPropagatesToPlayer() throws JSONException {
         PluginCall call = mock(PluginCall.class);
         when(call.getString(eq("title"), anyString())).thenReturn("Song Title");
         when(call.getString(eq("artist"), anyString())).thenReturn("Song Artist");
         when(call.getString(eq("album"), anyString())).thenReturn("Song Album");
-
-        JSArray emptyArtworkArray = new JSArray();
-        when(call.getArray("artwork")).thenReturn(emptyArtworkArray);
+        when(call.getArray("artwork")).thenReturn(new JSArray());
 
         plugin.setMetadata(call);
+        idleMainLooper();
 
-        MediaMetadataCompat metadata = controller.getMetadata();
-        assertNotNull(metadata);
-        assertEquals("Song Title", metadata.getString(MediaMetadataCompat.METADATA_KEY_TITLE));
-        assertEquals("Song Artist", metadata.getString(MediaMetadataCompat.METADATA_KEY_ARTIST));
-        assertEquals("Song Album", metadata.getString(MediaMetadataCompat.METADATA_KEY_ALBUM));
-
+        MediaMetadata metadata = player.getMediaMetadata();
+        assertEquals("Song Title", String.valueOf(metadata.title));
+        assertEquals("Song Artist", String.valueOf(metadata.artist));
+        assertEquals("Song Album", String.valueOf(metadata.albumTitle));
         verify(call).resolve();
     }
 
     @Test
-    public void testSetPlaybackStatePropagatesToMediaSession() throws Exception {
-        PluginCall call = mock(PluginCall.class);
+    public void setMetadataDecodesBase64Artwork() throws JSONException {
+        PluginCall call = mockMetadataCallWithArtwork(createPngDataUrl(64, 64));
 
-        // Test playing
-        when(call.getString(eq("playbackState"), anyString())).thenReturn("playing");
-        plugin.setPlaybackState(call);
+        plugin.setMetadata(call);
+        idleMainLooper();
 
-        PlaybackStateCompat state = controller.getPlaybackState();
-        assertNotNull(state);
-        assertEquals(PlaybackStateCompat.STATE_PLAYING, state.getState());
-
-        // Test paused
-        when(call.getString(eq("playbackState"), anyString())).thenReturn("paused");
-        plugin.setPlaybackState(call);
-
-        state = controller.getPlaybackState();
-        assertNotNull(state);
-        assertEquals(PlaybackStateCompat.STATE_PAUSED, state.getState());
-
-        // Test none
-        // Need to bypass auto-stop unbinding logic for unit tests easily by setting config
-        Field configField = MediaSessionPlugin.class.getDeclaredField("startServiceOnlyDuringPlayback");
-        configField.setAccessible(true);
-        configField.set(plugin, false);
-
-        when(call.getString(eq("playbackState"), anyString())).thenReturn("none");
-        plugin.setPlaybackState(call);
-
-        state = controller.getPlaybackState();
-        assertNotNull(state);
-        assertEquals(PlaybackStateCompat.STATE_NONE, state.getState());
-
-        verify(call, times(3)).resolve();
+        byte[] artworkData = player.getMediaMetadata().artworkData;
+        assertNotNull(artworkData);
+        Bitmap decoded = BitmapFactory.decodeByteArray(artworkData, 0, artworkData.length);
+        assertEquals(64, decoded.getWidth());
+        assertEquals(64, decoded.getHeight());
+        verify(call).resolve();
     }
 
     @Test
-    public void testSetPositionStatePropagatesToMediaSession() {
+    public void setMetadataScalesDownOversizedArtwork() throws JSONException {
+        PluginCall call = mockMetadataCallWithArtwork(createPngDataUrl(1024, 768));
+
+        plugin.setMetadata(call);
+        idleMainLooper();
+
+        byte[] artworkData = player.getMediaMetadata().artworkData;
+        assertNotNull(artworkData);
+        Bitmap decoded = BitmapFactory.decodeByteArray(artworkData, 0, artworkData.length);
+        assertEquals(512, decoded.getWidth());
+        assertEquals(384, decoded.getHeight());
+    }
+
+    @Test
+    public void setMetadataToleratesInvalidArtwork() throws JSONException {
+        PluginCall call = mockMetadataCallWithArtwork("data:image/png;base64,!!!not-base64!!!");
+
+        plugin.setMetadata(call);
+        idleMainLooper();
+
+        assertNull(player.getMediaMetadata().artworkData);
+        assertEquals("Song Title", String.valueOf(player.getMediaMetadata().title));
+        verify(call).resolve();
+    }
+
+    private PluginCall mockMetadataCallWithArtwork(String src) throws JSONException {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString(eq("title"), anyString())).thenReturn("Song Title");
+        when(call.getString(eq("artist"), anyString())).thenReturn("Song Artist");
+        when(call.getString(eq("album"), anyString())).thenReturn("Song Album");
+        JSArray artworkArray = new JSArray();
+        artworkArray.put(new JSObject().put("src", src));
+        when(call.getArray("artwork")).thenReturn(artworkArray);
+        return call;
+    }
+
+    private String createPngDataUrl(int width, int height) {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        bitmap.eraseColor(0xFF336699);
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+        return "data:image/png;base64," + Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP);
+    }
+
+    @Test
+    public void setPlaybackStatePlayingPropagatesToPlayer() {
+        registerActionHandlers("play", "pause");
+
+        setPlaybackState("playing");
+
+        assertEquals(Player.STATE_READY, player.getPlaybackState());
+        assertTrue(player.getPlayWhenReady());
+    }
+
+    @Test
+    public void setPlaybackStatePausedPropagatesToPlayer() {
+        registerActionHandlers("play", "pause");
+
+        setPlaybackState("playing");
+        setPlaybackState("paused");
+
+        assertEquals(Player.STATE_READY, player.getPlaybackState());
+        assertFalse(player.getPlayWhenReady());
+    }
+
+    @Test
+    public void setPlaybackStateNoneStopsServiceDuringPlaybackOnlyMode() throws Exception {
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        setPlaybackState("none");
+
+        assertNull(getPluginField("service"));
+    }
+
+    @Test
+    public void setPlaybackStateNoneKeepsServiceInAlwaysMode() throws Exception {
+        setPluginField("startServiceOnlyDuringPlayback", false);
+        setPlaybackState("playing");
+
+        setPlaybackState("none");
+
+        assertNotNull(getPluginField("service"));
+        assertEquals(Player.STATE_IDLE, player.getPlaybackState());
+    }
+
+    @Test
+    public void setPositionStatePropagatesToPlayer() {
         PluginCall call = mock(PluginCall.class);
         when(call.getDouble(eq("duration"), anyDouble())).thenReturn(100.0);
         when(call.getDouble(eq("position"), anyDouble())).thenReturn(50.5);
         when(call.getFloat(eq("playbackRate"), anyFloat())).thenReturn(1.5f);
 
         plugin.setPositionState(call);
+        idleMainLooper();
 
-        MediaMetadataCompat metadata = controller.getMetadata();
-        assertNotNull(metadata);
-        assertEquals(100000L, metadata.getLong(MediaMetadataCompat.METADATA_KEY_DURATION));
-
-        PlaybackStateCompat state = controller.getPlaybackState();
-        assertNotNull(state);
-        assertEquals(50500L, state.getPosition());
-        assertEquals(1.5f, state.getPlaybackSpeed(), 0.001);
-
+        assertEquals(100_000L, player.getDuration());
+        assertEquals(50_500L, player.getCurrentPosition());
+        assertEquals(1.5f, player.getPlaybackParameters().speed, 0.0001f);
         verify(call).resolve();
+    }
+
+    @Test
+    public void setActionHandlerKeepsCallAliveAndEnablesCommands() {
+        PluginCall playCall = mockActionHandlerCall("play");
+
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+
+        verify(playCall).setKeepAlive(true);
+        assertTrue(plugin.hasActionHandler("play"));
+        assertTrue(player.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+        assertFalse(player.isCommandAvailable(Player.COMMAND_SEEK_TO_NEXT));
+    }
+
+    @Test
+    public void hasActionHandlerIsFalseForDanglingCallback() {
+        PluginCall call = mockActionHandlerCall("play");
+        when(call.getCallbackId()).thenReturn(PluginCall.CALLBACK_ID_DANGLING);
+        plugin.setActionHandler(call);
+
+        assertFalse(plugin.hasActionHandler("play"));
+    }
+
+    @Test
+    public void playerPlayCommandResolvesPlayActionHandler() {
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        registerActionHandlers("pause");
+        setPlaybackState("paused");
+
+        player.play();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(playCall).resolve(captor.capture());
+        assertEquals("play", captor.getValue().getString("action"));
+    }
+
+    @Test
+    public void playerPauseCommandResolvesPauseActionHandler() {
+        PluginCall pauseCall = mockActionHandlerCall("pause");
+        plugin.setActionHandler(pauseCall);
+        registerActionHandlers("play");
+        setPlaybackState("playing");
+
+        player.pause();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(pauseCall).resolve(captor.capture());
+        assertEquals("pause", captor.getValue().getString("action"));
+    }
+
+    @Test
+    public void playerSeekCommandResolvesSeektoActionHandlerWithSeconds() throws JSONException {
+        PluginCall seekCall = mockActionHandlerCall("seekto");
+        plugin.setActionHandler(seekCall);
+        setPlaybackState("playing");
+
+        player.seekTo(42_000L);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(seekCall).resolve(captor.capture());
+        assertEquals("seekto", captor.getValue().getString("action"));
+        assertEquals(42.0, captor.getValue().getDouble("seekTime"), 0.0001);
+    }
+
+    @Test
+    public void playerNextAndPreviousCommandsResolveTrackHandlers() {
+        PluginCall nextCall = mockActionHandlerCall("nexttrack");
+        PluginCall previousCall = mockActionHandlerCall("previoustrack");
+        plugin.setActionHandler(nextCall);
+        plugin.setActionHandler(previousCall);
+        setPlaybackState("playing");
+
+        player.seekToNext();
+        player.seekToPrevious();
+
+        verify(nextCall).resolve(any(JSObject.class));
+        verify(previousCall).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void playerStopCommandResolvesStopActionHandler() {
+        PluginCall stopCall = mockActionHandlerCall("stop");
+        plugin.setActionHandler(stopCall);
+        setPlaybackState("playing");
+
+        player.stop();
+
+        verify(stopCall).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void actionCallbackIgnoresUnregisteredActions() {
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+
+        plugin.actionCallback("nexttrack");
+
+        verify(playCall, never()).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void actionCallbackAddsActionToData() {
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+
+        plugin.actionCallback("play");
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(playCall).resolve(captor.capture());
+        assertEquals("play", captor.getValue().getString("action"));
     }
 }
