@@ -37,8 +37,16 @@ import java.util.Set;
 public class MediaSessionPlugin extends Plugin {
     private static final String TAG = "MediaSessionPlugin";
 
-    /** Artwork is scaled down to at most this size (in pixels) before it is handed to Media3. */
+    /**
+     * Artwork is scaled down so its long edge is at most this many pixels before it is handed to
+     * Media3. Oversized bitmaps crossing the Binder to the platform MediaSession have crashed
+     * com.android.bluetooth's AVRCP layer, and the system downscales artwork for the
+     * notification/lock screen anyway, so the cap is lossless in practice.
+     */
     private static final int MAX_ARTWORK_DIMENSION = 512;
+
+    /** JPEG quality for the encoded artwork (cover art is opaque, so no alpha is lost). */
+    private static final int ARTWORK_JPEG_QUALITY = 85;
 
     private boolean startServiceOnlyDuringPlayback = true;
 
@@ -60,7 +68,7 @@ public class MediaSessionPlugin extends Plugin {
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
-            Log.d(TAG, "Connected to MediaSessionService");
+            Log.i(TAG, "onServiceConnected: binding proxy player action callback and pushing state");
             MediaSessionService.LocalBinder binder = (MediaSessionService.LocalBinder) iBinder;
             service = binder.getService();
             WebViewProxyPlayer player = service.getPlayer();
@@ -86,6 +94,8 @@ public class MediaSessionPlugin extends Plugin {
         if (foregroundServiceConfig.equals("always")) {
             startServiceOnlyDuringPlayback = false;
         }
+        Log.i(TAG, "load: foregroundService='" + foregroundServiceConfig
+                + "' startServiceOnlyDuringPlayback=" + startServiceOnlyDuringPlayback);
 
         if (!startServiceOnlyDuringPlayback) {
             startMediaService();
@@ -97,6 +107,7 @@ public class MediaSessionPlugin extends Plugin {
             return;
         }
         serviceBindingRequested = true;
+        Log.i(TAG, "startMediaService: bindService(MediaSessionService, BIND_AUTO_CREATE)");
         Intent intent = new Intent(getContext(), MediaSessionService.class);
         getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
     }
@@ -135,6 +146,8 @@ public class MediaSessionPlugin extends Plugin {
             MediaSessionService service = this.service;
             WebViewProxyPlayer player = service != null ? service.getPlayer() : null;
             if (player == null) {
+                Log.w(TAG, "updateServiceState: service not bound yet — dropping state update (playbackState="
+                        + playbackState + ", title='" + title + "')");
                 return;
             }
             player.updateSessionState(
@@ -151,22 +164,35 @@ public class MediaSessionPlugin extends Plugin {
         });
     }
 
+    /**
+     * Pure dimension math (unit-tested): scale {@code width}x{@code height} so the long edge is at
+     * most {@code maxEdge}, preserving aspect ratio and never upscaling. Returns
+     * {@code [width, height]} unchanged when already within bounds or for degenerate input.
+     */
+    static int[] computeScaledDimensions(int width, int height, int maxEdge) {
+        if (width <= 0 || height <= 0) {
+            return new int[] { width, height };
+        }
+        final int longEdge = Math.max(width, height);
+        if (longEdge <= maxEdge) {
+            return new int[] { width, height };
+        }
+        final double scale = (double) maxEdge / (double) longEdge;
+        return new int[] {
+            Math.max(1, (int) Math.round(width * scale)),
+            Math.max(1, (int) Math.round(height * scale))
+        };
+    }
+
     private Bitmap scaleBitmap(Bitmap bitmap) {
         if (bitmap == null) {
             return null;
         }
-        int width = bitmap.getWidth();
-        int height = bitmap.getHeight();
-        if (width <= MAX_ARTWORK_DIMENSION && height <= MAX_ARTWORK_DIMENSION) {
+        int[] dims = computeScaledDimensions(bitmap.getWidth(), bitmap.getHeight(), MAX_ARTWORK_DIMENSION);
+        if (dims[0] == bitmap.getWidth() && dims[1] == bitmap.getHeight()) {
             return bitmap;
         }
-        final double scale = (double) MAX_ARTWORK_DIMENSION / Math.max(width, height);
-        return Bitmap.createScaledBitmap(
-            bitmap,
-            Math.max(1, (int) Math.round(width * scale)),
-            Math.max(1, (int) Math.round(height * scale)),
-            true
-        );
+        return Bitmap.createScaledBitmap(bitmap, dims[0], dims[1], true);
     }
 
     private byte[] bitmapToArtworkData(Bitmap bitmap) {
@@ -175,7 +201,9 @@ public class MediaSessionPlugin extends Plugin {
         }
         Bitmap scaled = scaleBitmap(bitmap);
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
-        scaled.compress(Bitmap.CompressFormat.PNG, 90, stream);
+        // JPEG (not PNG): cover art is opaque, and JPEG keeps the encoded artwork comfortably under
+        // the Binder transaction limit on its way to the platform MediaSession.
+        scaled.compress(Bitmap.CompressFormat.JPEG, ARTWORK_JPEG_QUALITY, stream);
         return stream.toByteArray();
     }
 
@@ -265,7 +293,9 @@ public class MediaSessionPlugin extends Plugin {
     @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
     public void setActionHandler(PluginCall call) {
         call.setKeepAlive(true);
-        actionHandlers.put(call.getString("action"), call);
+        final String action = call.getString("action");
+        actionHandlers.put(action, call);
+        Log.d(TAG, "setActionHandler: registered '" + action + "' supportedActions=" + actionHandlers.keySet());
         updateServiceState();
     }
 
@@ -291,7 +321,8 @@ public class MediaSessionPlugin extends Plugin {
             data.put("action", action);
             actionHandlers.get(action).resolve(data);
         } else {
-            Log.d(TAG, "No handler for action " + action);
+            Log.w(TAG, "actionCallback DROPPED: no live handler for '" + action
+                    + "' (registration race or never registered) — control will do nothing");
         }
     }
 

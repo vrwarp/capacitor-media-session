@@ -65,8 +65,12 @@ dependencies {
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
 
-    implementation "androidx.media3:media3-session:$androidxMedia3Version"
-    implementation "androidx.media3:media3-common:$androidxMedia3Version"
+    // `api` (not `implementation`): the plugin's public classes extend Media3 types
+    // (MediaSessionService extends media3 MediaSessionService; WebViewProxyPlayer extends
+    // SimpleBasePlayer), so consumers that reference them — e.g. a host app's Robolectric
+    // tests — need the Media3 superclass chain on their compile classpath.
+    api "androidx.media3:media3-session:$androidxMedia3Version"
+    api "androidx.media3:media3-common:$androidxMedia3Version"
 
     testImplementation "junit:junit:$junitVersion"
     testImplementation "org.mockito:mockito-core:5.14.2"
@@ -74,4 +78,9 @@ dependencies {
     testImplementation "androidx.test:core:1.6.1"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    // L3 instrumented media-notification test (connectedDebugAndroidTest, needs a device/emulator):
+    androidTestImplementation "androidx.test:core:1.6.1"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "androidx.test:rules:1.6.1"
+    androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
 }
