@@ -34,6 +34,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.github.jofr.capacitor.mediasessionplugin.CustomActions.CustomActionSpec;
 
@@ -57,7 +59,12 @@ public class MediaSessionPlugin extends Plugin {
     private String title = "";
     private String artist = "";
     private String album = "";
-    private byte[] artworkData = null;
+    /**
+     * Encoded cover art handed to Media3. Written on the main looper (see the artwork-fetch flow in
+     * {@link #setMetadata}) and read by the bridge thread in {@link #updateServiceState}, hence
+     * {@code volatile}.
+     */
+    private volatile byte[] artworkData = null;
     private String playbackState = "none";
     private double duration = 0.0;
     private double position = 0.0;
@@ -72,6 +79,59 @@ public class MediaSessionPlugin extends Plugin {
     private final Map<String, CustomActionSpec> customActions = new LinkedHashMap<>();
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /**
+     * Loads encoded cover art bytes for a given artwork {@code src}. Indirection over
+     * {@link #urlToArtworkData} so tests can inject a deterministic fetcher (no real network) — not
+     * a public/plugin API.
+     */
+    interface ArtworkFetcher {
+        byte[] fetch(String src) throws IOException;
+    }
+
+    private ArtworkFetcher artworkFetcher = this::urlToArtworkData;
+
+    /**
+     * Single-threaded, daemon executor that runs the blocking artwork fetch OFF the Capacitor
+     * bridge thread (every {@code @PluginMethod} runs on one shared background HandlerThread, so a
+     * synchronous {@code HttpURLConnection} in {@code setMetadata} would block every other plugin
+     * call). The executor only touches a captured local {@code src} and returns bytes by value; all
+     * shared state ({@link #artworkData}, {@link #artworkGeneration}) is mutated back on the main
+     * looper.
+     */
+    private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "media-session-artwork");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /**
+     * Monotonic token identifying the most recent artwork request. MAIN-THREAD-CONFINED: bumped and
+     * compared only on the main looper so a slow/older fetch result is discarded when a newer
+     * {@code setMetadata} artwork request has superseded it.
+     */
+    private long artworkGeneration = 0;
+
+    /** Test seam: replace the network-backed artwork fetcher. Package-private, NOT a plugin API. */
+    void setArtworkFetcher(ArtworkFetcher fetcher) {
+        this.artworkFetcher = fetcher;
+    }
+
+    /**
+     * Test hook: block until any in-flight artwork fetch on {@link #artworkExecutor} has run (up to
+     * {@code timeoutMs}). Because the executor is single-threaded, submitting a barrier task and
+     * awaiting it guarantees all previously-submitted fetches have completed. The result-delivery
+     * runnable they post back to the main looper must still be drained separately via
+     * {@code idleMainLooper()}. Package-private, test-only.
+     */
+    boolean awaitArtworkIdle(long timeoutMs) {
+        try {
+            artworkExecutor.submit(() -> {}).get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     private MediaSessionService service = null;
     private boolean serviceBindingRequested = false;
@@ -205,6 +265,104 @@ public class MediaSessionPlugin extends Plugin {
         };
     }
 
+    /**
+     * Sentinel max-edge for the {@code "any"} {@code sizes} token (e.g. vector artwork). The selector
+     * substitutes {@link #MAX_ARTWORK_DIMENSION} for it so an {@code "any"} entry ties an ideal raster
+     * of the target size rather than always winning as "largest".
+     */
+    static final int ANY_EDGE = Integer.MAX_VALUE;
+
+    /**
+     * Parses a Media Session {@code sizes} string (space-separated {@code WxH} tokens, case-insensitive
+     * {@code x}) into the entry's max edge: the largest {@code max(W,H)} across its tokens. The
+     * special token {@code "any"} yields {@link #ANY_EDGE}. Missing/empty/unparseable input returns
+     * {@code 0}. Pure (unit-tested via {@code ArtworkSelectionTest}).
+     */
+    static int parseMaxEdge(String sizes) {
+        if (sizes == null) {
+            return 0;
+        }
+        int best = 0;
+        boolean any = false;
+        for (String token : sizes.trim().split("\\s+")) {
+            if (token.isEmpty()) {
+                continue;
+            }
+            if (token.equalsIgnoreCase("any")) {
+                any = true;
+                continue;
+            }
+            int xIndex = token.indexOf('x');
+            if (xIndex < 0) {
+                xIndex = token.indexOf('X');
+            }
+            if (xIndex <= 0 || xIndex >= token.length() - 1) {
+                continue;
+            }
+            try {
+                int w = Integer.parseInt(token.substring(0, xIndex));
+                int h = Integer.parseInt(token.substring(xIndex + 1));
+                best = Math.max(best, Math.max(w, h));
+            } catch (NumberFormatException e) {
+                // ignore unparseable token
+            }
+        }
+        if (best == 0 && any) {
+            return ANY_EDGE;
+        }
+        return best;
+    }
+
+    /**
+     * Picks the single most appropriate artwork {@code src} for a {@code targetEdge} (in px), so only
+     * ONE image is fetched per {@code setMetadata} (avoiding redundant downloads). Entries with a
+     * null/empty {@code src} are skipped. Preference: the entry whose max edge is {@code >= targetEdge}
+     * and SMALLEST among those; otherwise the LARGEST available (closest from below); when all sizes
+     * are unknown ({@code 0}) the LAST usable entry wins (preserves the historical last-wins
+     * behaviour); ties resolve to the LAST such entry. Returns {@code null} when nothing is usable.
+     * Pure (unit-tested via {@code ArtworkSelectionTest}).
+     */
+    static String selectArtworkSrc(List<JSONObject> artwork, int targetEdge) {
+        if (artwork == null) {
+            return null;
+        }
+        String bestAtOrAbove = null;
+        int bestAtOrAboveEdge = Integer.MAX_VALUE;
+        String bestBelow = null;
+        int bestBelowEdge = -1;
+        for (JSONObject entry : artwork) {
+            if (entry == null) {
+                continue;
+            }
+            String src = entry.optString("src", null);
+            if (src == null || src.isEmpty()) {
+                continue;
+            }
+            int edge = parseMaxEdge(entry.optString("sizes", null));
+            if (edge == ANY_EDGE) {
+                // "any" ties an ideal raster of the target size.
+                edge = targetEdge;
+            }
+            if (edge >= targetEdge) {
+                // "<=" so a later tie at the same edge wins (last-wins on ties).
+                if (edge <= bestAtOrAboveEdge) {
+                    bestAtOrAboveEdge = edge;
+                    bestAtOrAbove = src;
+                }
+            } else {
+                // ">=" so a later tie (including the all-unknown 0 case) wins (last-wins on ties).
+                if (edge >= bestBelowEdge) {
+                    bestBelowEdge = edge;
+                    bestBelow = src;
+                }
+            }
+        }
+        if (bestAtOrAbove != null) {
+            return bestAtOrAbove;
+        }
+        return bestBelow;
+    }
+
     private Bitmap scaleBitmap(Bitmap bitmap) {
         if (bitmap == null) {
             return null;
@@ -259,30 +417,56 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setMetadata(PluginCall call) throws JSONException {
+        // Text fields are applied synchronously on the bridge thread (current-field defaults).
         title = call.getString("title", title);
         artist = call.getString("artist", artist);
         album = call.getString("album", album);
 
         final JSArray artworkArray = call.getArray("artwork");
-        if (artworkArray != null) {
-            final List<JSONObject> artworkList = artworkArray.toList();
-            for (JSONObject artwork : artworkList) {
-                String src = artwork.optString("src", null);
-                if (src == null) {
-                    continue;
-                }
-                try {
-                    byte[] data = urlToArtworkData(src);
-                    if (data != null) {
-                        this.artworkData = data;
-                    }
-                } catch (IOException | RuntimeException e) {
-                    Log.w(TAG, "Could not load artwork from " + src, e);
-                }
-            }
+        if (artworkArray == null) {
+            // Artwork key absent: leave any previous cover untouched, push the text update, done.
+            updateServiceState();
+            call.resolve();
+            return;
         }
 
-        updateServiceState();
+        // Artwork key present: select a single src (off-thread fetch) on the main looper so the
+        // artworkData/artworkGeneration single-writer invariant holds. Resolve immediately on the
+        // bridge thread — the promise must NOT wait for the (possibly slow) network fetch.
+        final List<JSONObject> artworkList = artworkArray.toList();
+        mainHandler.post(() -> {
+            final long generation = ++artworkGeneration;
+            final String src = selectArtworkSrc(artworkList, MAX_ARTWORK_DIMENSION);
+            // Reflect the text update immediately (artwork may change again below / shortly after).
+            updateServiceState();
+            if (src == null) {
+                // Array present but nothing usable: clear any previous cover (stale-clearing rule).
+                artworkData = null;
+                updateServiceState();
+                return;
+            }
+            artworkExecutor.submit(() -> {
+                byte[] data;
+                try {
+                    data = artworkFetcher.fetch(src);
+                } catch (IOException | RuntimeException e) {
+                    Log.w(TAG, "Could not load artwork from " + src, e);
+                    data = null;
+                }
+                final byte[] result = data;
+                mainHandler.post(() -> {
+                    if (generation != artworkGeneration) {
+                        // A newer artwork request superseded this one; discard the stale result.
+                        return;
+                    }
+                    // Assign unconditionally: a failed/empty fetch CLEARS the previous cover so the
+                    // displayed artwork always reflects the most recently supplied array.
+                    artworkData = result;
+                    updateServiceState();
+                });
+            });
+        });
+
         call.resolve();
     }
 
@@ -303,9 +487,11 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setPositionState(PluginCall call) {
-        duration = call.getDouble("duration", 0.0);
-        position = call.getDouble("position", 0.0);
-        playbackRate = call.getFloat("playbackRate", 1.0F);
+        // Omitted fields preserve the previously set values (mirroring setMetadata's text defaulting);
+        // pass 0/0/1 explicitly to reset.
+        duration = call.getDouble("duration", this.duration);
+        position = call.getDouble("position", this.position);
+        playbackRate = call.getFloat("playbackRate", (float) this.playbackRate);
 
         updateServiceState();
         call.resolve();
@@ -410,6 +596,7 @@ public class MediaSessionPlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
+        artworkExecutor.shutdownNow();
         stopMediaService();
         super.handleOnDestroy();
     }

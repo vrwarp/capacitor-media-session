@@ -57,6 +57,14 @@ Sets metadata of the currently playing media. Analogue to setting the
 interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/metadata)
 when using the Media Session API directly.
 
+On Android, artwork handling differs from the Web API: only a **single**
+`artwork` entry is fetched, selected by its `sizes` (the smallest image at
+least ~512px, otherwise the largest available). Fetching is
+**asynchronous** — the returned promise resolves before the image has
+loaded, and the artwork appears shortly afterwards. Supplying an `artwork`
+array whose selected image fails to load **clears** any previously shown
+cover, whereas omitting the `artwork` property entirely **preserves** it.
+
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |
 | **`options`** | <code><a href="#metadataoptions">MetadataOptions</a></code> |
@@ -124,6 +132,10 @@ Update current media playback position, duration and speed. Analogue to
 calling [setPositionState() of the MediaSession
 interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setPositionState)
 when using the Media Session API directly.
+
+On Android, omitting `duration`, `position` or `playbackRate`
+**preserves** the previously set value for that field; pass `0` / `0` / `1`
+explicitly to reset them.
 
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |

@@ -1,5 +1,6 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -54,7 +55,11 @@ import org.robolectric.android.controller.ServiceController;
 import org.robolectric.annotation.Config;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Functional tests for the Capacitor plugin: plugin calls must be reflected in the Media3 proxy
@@ -117,6 +122,23 @@ public class MediaSessionPluginTest {
 
     private static void idleMainLooper() {
         shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    /**
+     * Deterministically drains the asynchronous artwork pipeline:
+     * <ol>
+     *   <li>{@code idleMainLooper()} — run the main-thread runnable {@code setMetadata} posted, which
+     *       selects the src and submits the fetch to the executor;</li>
+     *   <li>{@code awaitArtworkIdle} — block until that fetch task has finished on the executor;</li>
+     *   <li>{@code idleMainLooper()} — run the result-delivery runnable the fetch posted back to the
+     *       main looper (assigns {@code artworkData} and pushes it to the player).</li>
+     * </ol>
+     * No {@code Thread.sleep}; replaces the previous synchronous assumption.
+     */
+    private void drainArtwork() {
+        idleMainLooper();
+        assertTrue("artwork executor should drain", plugin.awaitArtworkIdle(5000));
+        idleMainLooper();
     }
 
     private PluginCall mockActionHandlerCall(String action) {
@@ -189,7 +211,7 @@ public class MediaSessionPluginTest {
         PluginCall call = mockMetadataCallWithArtwork(createPngDataUrl(64, 64));
 
         plugin.setMetadata(call);
-        idleMainLooper();
+        drainArtwork();
 
         byte[] artworkData = player.getMediaMetadata().artworkData;
         assertNotNull(artworkData);
@@ -204,7 +226,7 @@ public class MediaSessionPluginTest {
         PluginCall call = mockMetadataCallWithArtwork(createPngDataUrl(1024, 768));
 
         plugin.setMetadata(call);
-        idleMainLooper();
+        drainArtwork();
 
         byte[] artworkData = player.getMediaMetadata().artworkData;
         assertNotNull(artworkData);
@@ -218,7 +240,7 @@ public class MediaSessionPluginTest {
         PluginCall call = mockMetadataCallWithArtwork("data:image/png;base64,!!!not-base64!!!");
 
         plugin.setMetadata(call);
-        idleMainLooper();
+        drainArtwork();
 
         assertNull(player.getMediaMetadata().artworkData);
         assertEquals("Song Title", String.valueOf(player.getMediaMetadata().title));
@@ -226,12 +248,36 @@ public class MediaSessionPluginTest {
     }
 
     private PluginCall mockMetadataCallWithArtwork(String src) throws JSONException {
+        PluginCall call = mockMetadataTextCall();
+        JSArray artworkArray = new JSArray();
+        artworkArray.put(new JSObject().put("src", src));
+        when(call.getArray("artwork")).thenReturn(artworkArray);
+        return call;
+    }
+
+    /** Base metadata call stubbing only the text fields; subclasses decide the artwork stub. */
+    private PluginCall mockMetadataTextCall() {
         PluginCall call = mock(PluginCall.class);
         when(call.getString(eq("title"), anyString())).thenReturn("Song Title");
         when(call.getString(eq("artist"), anyString())).thenReturn("Song Artist");
         when(call.getString(eq("album"), anyString())).thenReturn("Song Album");
+        return call;
+    }
+
+    /** Metadata call with an artwork array of (src, sizes) pairs; sizes may be null. */
+    private PluginCall mockMetadataCallWithArtworkEntries(String[][] entries) throws JSONException {
+        PluginCall call = mockMetadataTextCall();
         JSArray artworkArray = new JSArray();
-        artworkArray.put(new JSObject().put("src", src));
+        for (String[] e : entries) {
+            JSObject obj = new JSObject();
+            if (e[0] != null) {
+                obj.put("src", e[0]);
+            }
+            if (e.length > 1 && e[1] != null) {
+                obj.put("sizes", e[1]);
+            }
+            artworkArray.put(obj);
+        }
         when(call.getArray("artwork")).thenReturn(artworkArray);
         return call;
     }
@@ -489,6 +535,204 @@ public class MediaSessionPluginTest {
         ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
         verify(playCall).resolve(captor.capture());
         assertEquals("play", captor.getValue().getString("action"));
+    }
+
+    // --- Async artwork ------------------------------------------------------------------------
+
+    private static final byte[] FIXED_ARTWORK_BYTES = new byte[] { 1, 2, 3, 4, 5 };
+
+    @Test
+    public void setMetadataResolvesBeforeArtworkFetchCompletes() throws Exception {
+        // The fetch blocks on a latch; resolve() must already have happened by the time we let it run.
+        CountDownLatch fetchGate = new CountDownLatch(1);
+        AtomicBoolean fetchStarted = new AtomicBoolean(false);
+        plugin.setArtworkFetcher(src -> {
+            fetchStarted.set(true);
+            try {
+                fetchGate.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FIXED_ARTWORK_BYTES;
+        });
+
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/cover.png");
+        plugin.setMetadata(call);
+        // resolve() is synchronous on the bridge thread, independent of the fetch.
+        verify(call).resolve();
+        // The fetch has not delivered bytes yet (still gated).
+        idleMainLooper();
+        assertNull(player.getMediaMetadata().artworkData);
+
+        // Release the fetch and drain: bytes now land.
+        fetchGate.countDown();
+        assertTrue(plugin.awaitArtworkIdle(5000));
+        idleMainLooper();
+        assertTrue(fetchStarted.get());
+        assertArrayEquals(FIXED_ARTWORK_BYTES, player.getMediaMetadata().artworkData);
+    }
+
+    @Test
+    public void setMetadataDeliversArtworkAsynchronously() throws Exception {
+        plugin.setArtworkFetcher(src -> FIXED_ARTWORK_BYTES);
+
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/cover.png");
+        plugin.setMetadata(call);
+        drainArtwork();
+
+        assertArrayEquals(FIXED_ARTWORK_BYTES, player.getMediaMetadata().artworkData);
+        verify(call).resolve();
+    }
+
+    @Test
+    public void newArtworkArrayThatFailsClearsPreviousCover() throws Exception {
+        // First set a valid base64 cover so artworkData != null (real default fetcher).
+        PluginCall first = mockMetadataCallWithArtwork(createPngDataUrl(64, 64));
+        plugin.setMetadata(first);
+        drainArtwork();
+        assertNotNull(player.getMediaMetadata().artworkData);
+
+        // Now supply a new artwork array whose fetch fails; the old cover must be CLEARED.
+        plugin.setArtworkFetcher(src -> {
+            throw new IOException("boom");
+        });
+        PluginCall second = mock(PluginCall.class);
+        when(second.getString(eq("title"), anyString())).thenReturn("New Title");
+        when(second.getString(eq("artist"), anyString())).thenReturn("Song Artist");
+        when(second.getString(eq("album"), anyString())).thenReturn("Song Album");
+        JSArray artworkArray = new JSArray();
+        artworkArray.put(new JSObject().put("src", "http://example.com/missing.png"));
+        when(second.getArray("artwork")).thenReturn(artworkArray);
+
+        plugin.setMetadata(second);
+        drainArtwork();
+
+        assertNull(player.getMediaMetadata().artworkData);
+        assertEquals("New Title", String.valueOf(player.getMediaMetadata().title));
+    }
+
+    @Test
+    public void absentArtworkKeyPreservesPreviousCover() throws Exception {
+        PluginCall first = mockMetadataCallWithArtwork(createPngDataUrl(64, 64));
+        plugin.setMetadata(first);
+        drainArtwork();
+        byte[] cover = player.getMediaMetadata().artworkData;
+        assertNotNull(cover);
+
+        // A metadata update with NO artwork key (getArray returns null) must leave the cover intact.
+        PluginCall textOnly = mock(PluginCall.class);
+        when(textOnly.getString(eq("title"), anyString())).thenReturn("Just Text");
+        when(textOnly.getString(eq("artist"), anyString())).thenReturn("Song Artist");
+        when(textOnly.getString(eq("album"), anyString())).thenReturn("Song Album");
+        when(textOnly.getArray("artwork")).thenReturn(null);
+
+        plugin.setMetadata(textOnly);
+        drainArtwork();
+
+        assertArrayEquals(cover, player.getMediaMetadata().artworkData);
+        assertEquals("Just Text", String.valueOf(player.getMediaMetadata().title));
+        verify(textOnly).resolve();
+    }
+
+    @Test
+    public void emptyArtworkArrayClearsCoverAndDoesNotFetch() throws Exception {
+        PluginCall first = mockMetadataCallWithArtwork(createPngDataUrl(64, 64));
+        plugin.setMetadata(first);
+        drainArtwork();
+        assertNotNull(player.getMediaMetadata().artworkData);
+
+        AtomicBoolean fetched = new AtomicBoolean(false);
+        plugin.setArtworkFetcher(src -> {
+            fetched.set(true);
+            return FIXED_ARTWORK_BYTES;
+        });
+        // Empty array: no usable src -> clear, and the fetcher must never run.
+        PluginCall empty = mockMetadataTextCall();
+        when(empty.getArray("artwork")).thenReturn(new JSArray());
+
+        plugin.setMetadata(empty);
+        drainArtwork();
+
+        assertNull(player.getMediaMetadata().artworkData);
+        assertFalse("empty array must not trigger a fetch", fetched.get());
+    }
+
+    @Test
+    public void staleArtworkResultIsDiscardedByGeneration() throws Exception {
+        // Request A blocks; request B (newer) returns bytes. The final artwork must be B's, never A's.
+        CountDownLatch gateA = new CountDownLatch(1);
+        byte[] bytesA = new byte[] { 9, 9, 9 };
+        byte[] bytesB = new byte[] { 7, 7, 7 };
+        plugin.setArtworkFetcher(src -> {
+            if (src.contains("A")) {
+                try {
+                    gateA.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return bytesA;
+            }
+            return bytesB;
+        });
+
+        PluginCall callA = mockMetadataCallWithArtwork("http://example.com/A.png");
+        plugin.setMetadata(callA);
+        idleMainLooper(); // run selection for A -> submits the (blocked) fetch, bumps generation to 1
+
+        PluginCall callB = mockMetadataCallWithArtwork("http://example.com/B.png");
+        plugin.setMetadata(callB);
+        idleMainLooper(); // run selection for B -> bumps generation to 2, submits B's fetch (queued)
+
+        // Let A finish first (it was submitted first on the single thread), then B.
+        gateA.countDown();
+        assertTrue(plugin.awaitArtworkIdle(5000));
+        idleMainLooper(); // run both result-delivery posts; A's is discarded (stale generation)
+
+        assertArrayEquals(bytesB, player.getMediaMetadata().artworkData);
+    }
+
+    @Test
+    public void selectorIntegrationDecodesSizeSelectedEntry() throws Exception {
+        // Three real base64 PNGs of different sizes; the 512-target selector must pick the 512 one
+        // (smallest >= target), and the decoded bytes must match that size.
+        PluginCall call = mockMetadataCallWithArtworkEntries(new String[][] {
+                { createPngDataUrl(128, 128), "128x128" },
+                { createPngDataUrl(512, 512), "512x512" },
+                { createPngDataUrl(1024, 1024), "1024x1024" }
+        });
+
+        plugin.setMetadata(call);
+        drainArtwork();
+
+        byte[] artworkData = player.getMediaMetadata().artworkData;
+        assertNotNull(artworkData);
+        Bitmap decoded = BitmapFactory.decodeByteArray(artworkData, 0, artworkData.length);
+        assertEquals(512, decoded.getWidth());
+        assertEquals(512, decoded.getHeight());
+    }
+
+    @Test
+    public void setPositionStatePreservesOmittedFields() {
+        // First set full position state.
+        PluginCall full = mock(PluginCall.class);
+        when(full.getDouble(eq("duration"), anyDouble())).thenReturn(120.0);
+        when(full.getDouble(eq("position"), anyDouble())).thenReturn(10.0);
+        when(full.getFloat(eq("playbackRate"), anyFloat())).thenReturn(2.0f);
+        plugin.setPositionState(full);
+        idleMainLooper();
+
+        // Second call omits duration/playbackRate: getDouble/getFloat return the default arg, which is
+        // now the previously stored value. Only position is updated.
+        PluginCall partial = mock(PluginCall.class);
+        when(partial.getDouble(eq("duration"), anyDouble())).thenAnswer(inv -> inv.getArgument(1));
+        when(partial.getDouble(eq("position"), anyDouble())).thenReturn(55.0);
+        when(partial.getFloat(eq("playbackRate"), anyFloat())).thenAnswer(inv -> inv.getArgument(1));
+        plugin.setPositionState(partial);
+        idleMainLooper();
+
+        assertEquals(120_000L, player.getDuration());
+        assertEquals(55_000L, player.getCurrentPosition());
+        assertEquals(2.0f, player.getPlaybackParameters().speed, 0.0001f);
     }
 
     // --- Custom actions -----------------------------------------------------------------------
