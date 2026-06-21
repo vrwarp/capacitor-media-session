@@ -30,6 +30,23 @@ The API of this plugin is modeled after the [already widely supported](https://d
 
 __There is one notable difference compared to the Web API__: You have to explicitly set the playback state to `"playing"` (using [`setPlaybackState()`](#setplaybackstate)) for the notification to start showing. You also have to explicitly set action handlers for play/pause (using [`setActionHandler()`](#setactionhandler)) for the controls in the notification to show up and work. For simple cases on the Web platform (e.g. playing audio using an `<audio>` element) the browser detects playback and wires simple actions like play/pause automatically up. Using this plugin you have to wire up the `<audio>` element manually because the plugin cannot detect audio playback in the WebView on Android automatically. There is an example app included in the repository [that shows how to do that](https://github.com/jofr/capacitor-media-session/blob/main/example/src/js/media-session.js).
 
+### Custom actions (Android)
+
+Besides the standard Media Session actions you can register a *custom action* by passing any non-standard action string together with a `label` (and optional `icon`). A common pattern is a toggle that re-registers itself from inside its own handler to flip the label and icon:
+
+```typescript
+let liked = false;
+const registerLike = () => {
+  MediaSession.setActionHandler(
+    { action: 'like', label: liked ? 'Unlike' : 'Like', icon: liked ? 'heart-filled' : 'heart' },
+    () => { liked = !liked; registerLike(); }
+  );
+};
+registerLike();
+```
+
+On Android custom actions render as extra Media3 custom-layout buttons in the media notification; on Web and iOS they are a silent no-op (only the standard actions are supported there).
+
 ## API
 
 <docgen-index>

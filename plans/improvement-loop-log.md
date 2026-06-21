@@ -327,3 +327,111 @@ public TS or native method signature changes):
   would exercise the round trip.
 - **R3 (carried, narrowed)** — `blob:` artwork URLs remain unsupported on Android (the branch now
   cleanly clears rather than no-ops, but real blob decoding is still TODO).
+
+### Iteration 4 — handler-map thread-confinement + example/README custom-action demo
+
+**Shipped** (addresses deferred **R-C** handler-map threading + **U-B** example custom-action demo)
+
+Confined ALL `actionHandlers`/`customActions` access **and** the kept-alive `PluginCall`
+resolve/release/setKeepAlive lifecycle to the MAIN looper, collapsing handler registration and the
+player/layout publish into a single main-looper turn. The Media3 session/player continue to be
+touched only on the main looper. **No public TS or native signature changes; standard-action
+behaviour is byte-for-byte identical** (same ops, relocated to one thread). Before this change the
+maps were mutated on the Capacitor bridge thread while `actionHandlers.keySet()` was also iterated
+there to build `supportedActions` — a read/write straddling two threads (`updateServiceState`'s
+snapshot vs. the bridge-thread writers), and registration vs. publish could interleave.
+
+- **R4/R6 — `setActionHandler` is now a thin bridge-thread prologue.** It validates `action`
+  (rejecting on the bridge thread as before), extracts `removeHandler`/`label`/`icon` + the
+  `PluginCall` into locals, calls `call.setKeepAlive(true)` **on the bridge thread for the non-remove
+  case** (establishing the RETURN_CALLBACK contract before the call escapes threads — matches the
+  existing `setKeepAlive` expectation), then `mainHandler.post(() -> applyActionHandler(...))`. The
+  remove case no longer resolves on the bridge thread; resolution moved into the runnable.
+- **R6 — new `applyActionHandler(...)` (main looper)** owns the whole previous body: previous-call
+  release, `customActions` remove/put, `actionHandlers.put`, then publishes player state + custom
+  layout **inline on main** (no further post). For the remove branch it `call.resolve()`s here. This
+  collapses registration + publish into one main-looper turn (fixes the register/publish interleave).
+- **`pushPlayerState()` extracted from `updateServiceState()`.** `pushPlayerState()` assumes it is
+  already on main and now takes the `actionHandlers.keySet()` → `supportedActions` snapshot **inside
+  it** (previously taken on the bridge thread before the post). `updateServiceState()` is now just
+  `mainHandler.post(this::pushPlayerState)`. `applyActionHandler` and the `setMetadata` artwork
+  runnable (already on main) call `pushPlayerState()` directly to avoid an extra hop.
+- **`updateCustomLayout()` no longer posts.** It snapshots `customActions.values()` inline on main
+  (its callers — `applyActionHandler`, `onServiceConnected` — already run there) and hands the
+  snapshot to `service.updateCustomActions(...)` (itself unchanged; still posts internally).
+- **R5 — `actionCallback(String, JSObject)` does a single guarded `get`.** `PluginCall call =
+  actionHandlers.get(action); if (call != null && !CALLBACK_ID_DANGLING.equals(call.getCallbackId())
+  && !call.isReleased()) { ... call.resolve(data); }` — one `get` (no TOCTOU on one thread), folding
+  in the `isReleased()` guard so a tap arriving after the stored call was released is dropped.
+- **`hasActionHandler` gained `&& !call.isReleased()`.** Both `actionCallback` signatures retained.
+- Brief Javadoc added on `actionHandlers`/`customActions`/`actionCallback`/`hasActionHandler`/
+  `pushPlayerState` documenting the main-looper confinement.
+
+**U5 — example + README custom-action demo**
+
+- `example/src/js/media-session.js` — added a self-re-registering `like` toggle (`let liked = false;`
+  + `registerLike()` helper, called once in setup) using only the public `{action,label,icon}`
+  surface; flips `Like`/`heart` ↔ `Unlike`/`heart-filled` from inside its own handler.
+- `README.md` — hand-written "Custom actions (Android)" subsection under `## Usage`, ABOVE the
+  `<docgen-index>` block (docgen only manages the `<docgen-index>`/`<docgen-api>` blocks, so the prose
+  survives `npm run build` — verified the build only touched those 17 added lines).
+
+**Files changed**
+
+- `android/.../MediaSessionPlugin.java` — thin `setActionHandler` prologue + new
+  `applyActionHandler`; `pushPlayerState()` split out of `updateServiceState()` with the `keySet()`
+  snapshot moved onto main; inline `updateCustomLayout()`; single-`get` guarded `actionCallback`;
+  `hasActionHandler` `isReleased()` guard; confinement Javadoc; `setMetadata` artwork runnable now
+  calls `pushPlayerState()` inline.
+- `android/.../MediaSessionPluginTest.java` — `times` import; idle added to three pre-existing
+  no-idle call-sites (`hasActionHandlerIsFalseForDanglingCallback`,
+  `actionCallbackIgnoresUnregisteredActions`, `actionCallbackAddsActionToData`) now that put/remove
+  happen in a posted runnable; 5 new confinement tests.
+- `example/src/js/media-session.js`, `example/tests/media-session.test.js` (like toggle + 1 test).
+- `README.md` — hand-written custom-actions subsection (outside docgen blocks).
+
+**Test cases added** (Android +5, example +1)
+
+- `MediaSessionPluginTest` (38 → 43): `removedHandlerThenTapDoesNotResolveReleasedCall` (R5 — remove
+  releases the stored call, a later tap resolves nothing, handler gone);
+  `actionCallbackDropsReleasedCallStillInMap` (exercises the `isReleased()` guard branch directly with
+  a still-mapped but released call); `registerThenImmediateTapResolvesExactlyOnce` (R4/R6 —
+  `times(1)` resolve with `action=="play"`); `registrationAndLayoutPublishSettleConsistently` (R6 —
+  after ONE idle, both `hasActionHandler("like")` and the session custom layout reflect the `like`
+  button); `reRegisterStillReleasesPreviousCallOnMain` (tap between two registrations; the released
+  first call is never resolved by the post-swap tap, the second resolves once).
+- Audit note: all other `setActionHandler` call-sites already idle via helpers
+  (`registerActionHandlers`, `setPlaybackState`) or a following `setPlaybackState`; the missing-action
+  reject test stays synchronous (no idle needed).
+- `media-session.test.js` (14 → 15): the `like` toggle re-registers with `Unlike`/`heart-filled`
+  after the handler fires; the existing "registers handlers for all actions" containment test still
+  passes.
+
+**Verification — all gates green**
+
+- Web: `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0); README regenerated and
+  the hand-written custom-actions prose survived (only the 17 added lines changed).
+- Android: `cd android && ./gradlew test` → `BUILD SUCCESSFUL`; **98 tests, 0 failures / 0 errors**
+  (ArtworkScalingTest 5, ArtworkSelectionTest 13, MediaSessionPluginTest 43, MediaSessionServiceTest 9,
+  WebViewProxyPlayerTest 28).
+- Example: `cd example && npm test` (vitest) → **15 tests passed** (1 file). `npm install` was run
+  first (dev-only vitest/jsdom; plugin is `file:..`).
+
+**Deviation from plan** — none of substance. (Test helper `mockActionHandlerCall` already stubs
+`isReleased()→false`, so the new tests stub `isReleased()→true` after the simulated release to drive
+the guard; the production release path itself is exercised via `verify(...).release(any())`.)
+
+**Deferred (seeds for the next critic)**
+
+- **NOT settling the register promise (DEFERRED to iteration 5).** The kept-alive RETURN_CALLBACK
+  call is the *same* call that delivers every tap; settling it correctly (so the register `Promise`
+  resolves once on registration while the call stays live for taps) needs its own slice. This
+  iteration leaves the register path keep-alive (does not resolve on register).
+- **F-A / F5 (carried)** — `onCustomCommand` args payload still dropped; no per-tap data reaches JS
+  (the `args` Bundle in `MediaSessionService.onCustomCommand` is unused; handler still gets only
+  `{action}`).
+- **U4 (carried/expanded)** — full `addListener`/`getState` JS-side state read-back + events, AND the
+  register-promise-settling above, remain open.
+- **F3 (carried)** — arbitrary bitmap icons for custom actions (still limited to the curated built-in
+  `CommandButton.ICON_*` set; no `iconUri`/custom drawable threading).
+- **R3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO).

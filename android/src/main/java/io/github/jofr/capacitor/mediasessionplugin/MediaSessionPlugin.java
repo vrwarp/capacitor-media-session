@@ -69,12 +69,22 @@ public class MediaSessionPlugin extends Plugin {
     private double duration = 0.0;
     private double position = 0.0;
     private double playbackRate = 1.0;
+    /**
+     * Registered action handlers (action -> kept-alive {@code RETURN_CALLBACK} {@link PluginCall}).
+     * MAIN-LOOPER-CONFINED: every read and write happens on the main looper. Writers (registration /
+     * removal in {@link #applyActionHandler}), readers (the {@code keySet()} snapshot in
+     * {@link #pushPlayerState}, {@link #hasActionHandler}, {@link #actionCallback}) and the
+     * PluginCall resolve/release/setKeepAlive lifecycle all run there, so a plain {@link HashMap} is
+     * safe without further synchronization. The bridge-thread {@link #setActionHandler} only posts to
+     * {@link #applyActionHandler}.
+     */
     private final Map<String, PluginCall> actionHandlers = new HashMap<>();
 
     /**
      * Custom-action button specs (id -> label + resolved icon) for actions that are not standard
      * Media Session actions. Insertion-ordered so the published custom layout is deterministic.
      * Kept in parallel with {@link #actionHandlers} and maintained on register/re-register/remove.
+     * MAIN-LOOPER-CONFINED like {@link #actionHandlers}.
      */
     private final Map<String, CustomActionSpec> customActions = new LinkedHashMap<>();
 
@@ -202,10 +212,21 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     /**
-     * Pushes the current metadata, playback and position state to the proxy player on the main
-     * thread (the player must only be accessed from its application looper).
+     * Schedules a push of the current metadata, playback and position state to the proxy player on
+     * the main thread (the player must only be accessed from its application looper). Just hops to
+     * {@link #pushPlayerState()}; the {@code actionHandlers} {@code keySet()} snapshot now happens
+     * there so the handler map is read on the main looper too.
      */
     private void updateServiceState() {
+        mainHandler.post(this::pushPlayerState);
+    }
+
+    /**
+     * Pushes the current metadata, playback and position state to the proxy player. MUST run on the
+     * main looper: it reads {@link #actionHandlers} (main-looper-confined) to build the supported
+     * standard-action set and touches the proxy player, which is bound to the application looper.
+     */
+    private void pushPlayerState() {
         final String playbackState = this.playbackState;
         final String title = this.title;
         final String artist = this.artist;
@@ -216,6 +237,7 @@ public class MediaSessionPlugin extends Plugin {
         final double playbackRate = this.playbackRate;
         // Only the standard actions map to Player.Commands; custom actions are surfaced separately
         // as session custom-layout buttons, so they must not reach the proxy player's command switch.
+        // Read on the main looper (see actionHandlers confinement).
         final Set<String> supportedActions = new HashSet<>();
         for (String action : actionHandlers.keySet()) {
             if (CustomActions.isStandard(action)) {
@@ -223,26 +245,24 @@ public class MediaSessionPlugin extends Plugin {
             }
         }
 
-        mainHandler.post(() -> {
-            MediaSessionService service = this.service;
-            WebViewProxyPlayer player = service != null ? service.getPlayer() : null;
-            if (player == null) {
-                Log.w(TAG, "updateServiceState: service not bound yet — dropping state update (playbackState="
-                        + playbackState + ", title='" + title + "')");
-                return;
-            }
-            player.updateSessionState(
-                playbackState,
-                title,
-                artist,
-                album,
-                artworkData,
-                duration,
-                position,
-                playbackRate,
-                supportedActions
-            );
-        });
+        MediaSessionService service = this.service;
+        WebViewProxyPlayer player = service != null ? service.getPlayer() : null;
+        if (player == null) {
+            Log.w(TAG, "pushPlayerState: service not bound yet — dropping state update (playbackState="
+                    + playbackState + ", title='" + title + "')");
+            return;
+        }
+        player.updateSessionState(
+            playbackState,
+            title,
+            artist,
+            album,
+            artworkData,
+            duration,
+            position,
+            playbackRate,
+            supportedActions
+        );
     }
 
     /**
@@ -438,11 +458,12 @@ public class MediaSessionPlugin extends Plugin {
             final long generation = ++artworkGeneration;
             final String src = selectArtworkSrc(artworkList, MAX_ARTWORK_DIMENSION);
             // Reflect the text update immediately (artwork may change again below / shortly after).
-            updateServiceState();
+            // Already on main, so push inline rather than re-posting.
+            pushPlayerState();
             if (src == null) {
                 // Array present but nothing usable: clear any previous cover (stale-clearing rule).
                 artworkData = null;
-                updateServiceState();
+                pushPlayerState();
                 return;
             }
             artworkExecutor.submit(() -> {
@@ -462,7 +483,7 @@ public class MediaSessionPlugin extends Plugin {
                     // Assign unconditionally: a failed/empty fetch CLEARS the previous cover so the
                     // displayed artwork always reflects the most recently supplied array.
                     artworkData = result;
-                    updateServiceState();
+                    pushPlayerState();
                 });
             });
         });
@@ -497,6 +518,15 @@ public class MediaSessionPlugin extends Plugin {
         call.resolve();
     }
 
+    /**
+     * Thin bridge-thread prologue for the {@code RETURN_CALLBACK} action-handler registration. It
+     * only validates {@code action} (rejecting on the bridge thread as before) and, for the
+     * non-remove case, establishes the {@code setKeepAlive(true)} contract BEFORE the call escapes to
+     * the main looper. All handler-map mutation, PluginCall release/resolve and the player/layout
+     * publish are deferred to {@link #applyActionHandler} on the main looper so the maps are touched
+     * from exactly one thread (see {@link #actionHandlers} confinement). The remove case is resolved
+     * inside the runnable, not here.
+     */
     @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
     public void setActionHandler(PluginCall call) {
         final String action = call.getString("action");
@@ -506,6 +536,27 @@ public class MediaSessionPlugin extends Plugin {
         }
 
         final boolean remove = call.getBoolean("removeHandler", false);
+        final String label = call.getString("label");
+        final String icon = call.getString("icon");
+
+        if (!remove) {
+            // Establish the RETURN_CALLBACK keep-alive contract before the call crosses threads, so
+            // the call is not auto-released while the registration runnable is in flight. (Matches the
+            // existing setKeepAlive expectation.)
+            call.setKeepAlive(true);
+        }
+
+        mainHandler.post(() -> applyActionHandler(action, remove, label, icon, call));
+    }
+
+    /**
+     * Applies an action-handler registration/removal on the MAIN looper: releases any previously
+     * stored kept-alive call, updates {@link #actionHandlers} and {@link #customActions}, then
+     * publishes the player state and (for custom actions) the session custom layout INLINE — all in a
+     * single main-looper turn so registration and publish settle consistently. For the remove case it
+     * also resolves {@code call} here (the bridge prologue intentionally did not).
+     */
+    private void applyActionHandler(String action, boolean remove, String label, String icon, PluginCall call) {
         final boolean custom = CustomActions.isCustom(action);
 
         // Always release any previously stored kept-alive call for this action before replacing or
@@ -521,8 +572,8 @@ public class MediaSessionPlugin extends Plugin {
             if (custom) {
                 customActions.remove(action);
             }
-            Log.d(TAG, "setActionHandler: removed '" + action + "' supportedActions=" + actionHandlers.keySet());
-            updateServiceState();
+            Log.d(TAG, "applyActionHandler: removed '" + action + "' supportedActions=" + actionHandlers.keySet());
+            pushPlayerState();
             updateCustomLayout();
             call.resolve();
             return;
@@ -532,41 +583,46 @@ public class MediaSessionPlugin extends Plugin {
             // Re-registering replaces the existing entry; remove first so the LinkedHashMap re-inserts
             // it at the end (toggle), then store the latest label/icon.
             customActions.remove(action);
-            final String label = call.getString("label");
-            final int iconConstant = CustomActions.iconConstant(call.getString("icon"));
+            final int iconConstant = CustomActions.iconConstant(icon);
             customActions.put(action, new CustomActionSpec(action, label, iconConstant));
         }
 
-        call.setKeepAlive(true);
+        // Keep-alive was already set on the bridge thread in setActionHandler.
         actionHandlers.put(action, call);
-        Log.d(TAG, "setActionHandler: registered '" + action + "' supportedActions=" + actionHandlers.keySet());
-        updateServiceState();
+        Log.d(TAG, "applyActionHandler: registered '" + action + "' supportedActions=" + actionHandlers.keySet());
+        pushPlayerState();
         if (custom) {
             updateCustomLayout();
         }
     }
 
     /**
-     * Pushes the current ordered custom-action specs to the service on the main thread so it can
-     * rebuild the session's custom layout. Guarded like {@link #updateServiceState}: if the service
-     * is not bound yet, the actions are replayed from {@code onServiceConnected}.
+     * Pushes the current ordered custom-action specs to the service so it can rebuild the session's
+     * custom layout. Snapshots {@link #customActions} on the MAIN looper (its only thread): callers
+     * already run on main ({@link #applyActionHandler}, {@code onServiceConnected}), so the snapshot
+     * is taken inline before handing it to the service. Guarded like {@link #pushPlayerState}: if the
+     * service is not bound yet, the actions are replayed from {@code onServiceConnected}.
      */
     private void updateCustomLayout() {
         final List<CustomActionSpec> specs = new ArrayList<>(customActions.values());
-        mainHandler.post(() -> {
-            MediaSessionService service = this.service;
-            if (service == null) {
-                Log.w(TAG, "updateCustomLayout: service not bound yet — dropping " + specs.size()
-                        + " custom action(s) (will replay on connect)");
-                return;
-            }
-            service.updateCustomActions(specs);
-        });
+        MediaSessionService service = this.service;
+        if (service == null) {
+            Log.w(TAG, "updateCustomLayout: service not bound yet — dropping " + specs.size()
+                    + " custom action(s) (will replay on connect)");
+            return;
+        }
+        service.updateCustomActions(specs);
     }
 
+    /**
+     * Whether a live (non-dangling, non-released) handler is registered for {@code action}. Reads
+     * {@link #actionHandlers}; call on the MAIN looper (its confinement thread).
+     */
     public boolean hasActionHandler(String action) {
         PluginCall call = actionHandlers.get(action);
-        return call != null && !call.getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING);
+        return call != null
+                && !call.getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING)
+                && !call.isReleased();
     }
 
     private void onPlayerAction(String action, Double seekTime, Double seekOffset) {
@@ -584,13 +640,23 @@ public class MediaSessionPlugin extends Plugin {
         actionCallback(action, new JSObject());
     }
 
+    /**
+     * Resolves the kept-alive handler for {@code action} with {@code data}. Reads
+     * {@link #actionHandlers} and touches the {@link PluginCall}; call on the MAIN looper (its
+     * confinement thread). A single {@code get} avoids any TOCTOU between the liveness check and the
+     * resolve, and the {@code isReleased()} guard drops taps that arrive after the stored call was
+     * released (e.g. handler just removed/re-registered).
+     */
     public void actionCallback(String action, JSObject data) {
-        if (hasActionHandler(action)) {
+        PluginCall call = actionHandlers.get(action);
+        if (call != null
+                && !PluginCall.CALLBACK_ID_DANGLING.equals(call.getCallbackId())
+                && !call.isReleased()) {
             data.put("action", action);
-            actionHandlers.get(action).resolve(data);
+            call.resolve(data);
         } else {
             Log.w(TAG, "actionCallback DROPPED: no live handler for '" + action
-                    + "' (registration race or never registered) — control will do nothing");
+                    + "' (registration race, released, or never registered) — control will do nothing");
         }
     }
 

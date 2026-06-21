@@ -84,4 +84,24 @@ export function setupMediaSession(audioElement) {
         audioElement.pause();
         updatePlaybackState();
     });
+
+    // Custom action: a "like" toggle. Custom actions are a non-standard action string with a
+    // `label` (and optional `icon`); on Android they render as an extra Media3 custom-layout button
+    // in the media notification, and they are a silent no-op on Web/iOS. Re-registering the same
+    // action from inside its own handler flips the label/icon, turning it into a toggle.
+    let liked = false;
+    const registerLike = () => {
+        MediaSession.setActionHandler(
+            {
+                action: 'like',
+                label: liked ? 'Unlike' : 'Like',
+                icon: liked ? 'heart-filled' : 'heart'
+            },
+            () => {
+                liked = !liked;
+                registerLike();
+            }
+        );
+    };
+    registerLike();
 }

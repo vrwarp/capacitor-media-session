@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.robolectric.Shadows.shadowOf;
@@ -443,6 +444,7 @@ public class MediaSessionPluginTest {
         PluginCall call = mockActionHandlerCall("play");
         when(call.getCallbackId()).thenReturn(PluginCall.CALLBACK_ID_DANGLING);
         plugin.setActionHandler(call);
+        idleMainLooper();
 
         assertFalse(plugin.hasActionHandler("play"));
     }
@@ -519,6 +521,7 @@ public class MediaSessionPluginTest {
     public void actionCallbackIgnoresUnregisteredActions() {
         PluginCall playCall = mockActionHandlerCall("play");
         plugin.setActionHandler(playCall);
+        idleMainLooper();
 
         plugin.actionCallback("nexttrack");
 
@@ -529,6 +532,7 @@ public class MediaSessionPluginTest {
     public void actionCallbackAddsActionToData() {
         PluginCall playCall = mockActionHandlerCall("play");
         plugin.setActionHandler(playCall);
+        idleMainLooper();
 
         plugin.actionCallback("play");
 
@@ -858,5 +862,98 @@ public class MediaSessionPluginTest {
         // The button is in the custom layout handed to the controller.
         assertEquals(1, result.customLayout.size());
         assertEquals("like", result.customLayout.get(0).sessionCommand.customAction);
+    }
+
+    // --- Handler-map thread confinement (R4/R5/R6) ---------------------------------------------
+
+    @Test
+    public void removedHandlerThenTapDoesNotResolveReleasedCall() {
+        // Register play, then remove it (which releases the stored kept-alive call). A later tap must
+        // not resolve the released call.
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+        assertTrue(plugin.hasActionHandler("play"));
+
+        PluginCall removeCall = mockRemoveHandlerCall("play");
+        plugin.setActionHandler(removeCall);
+        idleMainLooper();
+        // The stored call was released by removal; reflect that for the liveness guard.
+        when(playCall.isReleased()).thenReturn(true);
+
+        plugin.actionCallback("play");
+
+        verify(playCall, never()).resolve(any(JSObject.class));
+        assertFalse(plugin.hasActionHandler("play"));
+    }
+
+    @Test
+    public void actionCallbackDropsReleasedCallStillInMap() {
+        // Exercise the isReleased() guard branch directly: the call is still present in the map but
+        // reports released, so actionCallback must NOT resolve it.
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+        assertTrue(plugin.hasActionHandler("play"));
+
+        when(playCall.isReleased()).thenReturn(true);
+
+        plugin.actionCallback("play");
+
+        verify(playCall, never()).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void registerThenImmediateTapResolvesExactlyOnce() {
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+
+        plugin.actionCallback("play");
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(playCall, times(1)).resolve(captor.capture());
+        assertEquals("play", captor.getValue().getString("action"));
+    }
+
+    @Test
+    public void registrationAndLayoutPublishSettleConsistently() {
+        // After a SINGLE main-looper idle, both the handler map and the published custom layout must
+        // reflect the new custom action — registration + publish settle in one turn.
+        PluginCall likeCall = mockCustomActionHandlerCall("like", "Like", "heart");
+        plugin.setActionHandler(likeCall);
+        idleMainLooper();
+
+        assertTrue(plugin.hasActionHandler("like"));
+        ImmutableList<CommandButton> layout = customLayout();
+        assertEquals(1, layout.size());
+        assertEquals("like", layout.get(0).sessionCommand.customAction);
+    }
+
+    @Test
+    public void reRegisterStillReleasesPreviousCallOnMain() {
+        // Register, tap (resolves the first call), then re-register (releases the first, keeps the
+        // second). A post-swap tap must resolve only the second call, never the released first one.
+        PluginCall first = mockActionHandlerCall("play");
+        plugin.setActionHandler(first);
+        idleMainLooper();
+
+        plugin.actionCallback("play");
+        verify(first, times(1)).resolve(any(JSObject.class));
+
+        PluginCall second = mockActionHandlerCall("play");
+        plugin.setActionHandler(second);
+        idleMainLooper();
+
+        // The first call was released on the main looper during the swap.
+        verify(first).release(any());
+        when(first.isReleased()).thenReturn(true);
+        verify(second).setKeepAlive(true);
+
+        plugin.actionCallback("play");
+
+        // The released first call is never resolved by the post-swap tap; the second one is.
+        verify(first, times(1)).resolve(any(JSObject.class));
+        verify(second, times(1)).resolve(any(JSObject.class));
     }
 }

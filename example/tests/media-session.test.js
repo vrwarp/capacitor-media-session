@@ -192,4 +192,26 @@ describe('setupMediaSession', () => {
     expect(audio.pause).toHaveBeenCalled();
     expect(lastPlaybackState()).toBe('none');
   });
+
+  it('toggles the "like" custom action label and icon', () => {
+    const likeCalls = () =>
+      MediaSession.setActionHandler.mock.calls.filter(
+        ([options]) => options.action === 'like',
+      );
+
+    // First registration: "Like" / "heart".
+    const firstCalls = likeCalls();
+    expect(firstCalls.length).toBe(1);
+    expect(firstCalls[0][0]).toMatchObject({ label: 'Like', icon: 'heart' });
+
+    // Invoking the handler flips the state and re-registers as "Unlike" / "heart-filled".
+    getActionHandler('like')({ action: 'like' });
+
+    const secondCalls = likeCalls();
+    expect(secondCalls.length).toBe(2);
+    expect(secondCalls[1][0]).toMatchObject({
+      label: 'Unlike',
+      icon: 'heart-filled',
+    });
+  });
 });
