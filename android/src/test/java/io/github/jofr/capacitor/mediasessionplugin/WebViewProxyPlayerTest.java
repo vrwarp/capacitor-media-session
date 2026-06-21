@@ -3,6 +3,7 @@ package io.github.jofr.capacitor.mediasessionplugin;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import androidx.media3.common.C;
@@ -34,13 +35,15 @@ public class WebViewProxyPlayerTest {
     private WebViewProxyPlayer player;
     private final List<String> receivedActions = new ArrayList<>();
     private final List<Double> receivedSeekTimes = new ArrayList<>();
+    private final List<Double> receivedSeekOffsets = new ArrayList<>();
 
     @Before
     public void setUp() {
         player = new WebViewProxyPlayer();
-        player.setActionCallback((action, seekTime) -> {
+        player.setActionCallback((action, seekTime, seekOffset) -> {
             receivedActions.add(action);
             receivedSeekTimes.add(seekTime);
+            receivedSeekOffsets.add(seekOffset);
         });
     }
 
@@ -244,6 +247,8 @@ public class WebViewProxyPlayerTest {
 
         assertEquals(List.of("seekto"), receivedActions);
         assertEquals(30.0, receivedSeekTimes.get(0), 0.0001);
+        // A seekto carries an absolute position, not a relative offset.
+        assertNull(receivedSeekOffsets.get(0));
         // Optimistic update so the seek bar does not snap back.
         assertEquals(30_000L, player.getCurrentPosition());
     }
@@ -291,6 +296,9 @@ public class WebViewProxyPlayerTest {
         player.seekForward();
 
         assertEquals(List.of("seekforward"), receivedActions);
+        // seekforward delivers the increment as a relative offset in seconds, no absolute time.
+        assertNull(receivedSeekTimes.get(0));
+        assertEquals(WebViewProxyPlayer.SEEK_FORWARD_INCREMENT_MS / 1000.0, receivedSeekOffsets.get(0), 0.0001);
     }
 
     @Test
@@ -300,6 +308,8 @@ public class WebViewProxyPlayerTest {
         player.seekBack();
 
         assertEquals(List.of("seekbackward"), receivedActions);
+        assertNull(receivedSeekTimes.get(0));
+        assertEquals(WebViewProxyPlayer.SEEK_BACK_INCREMENT_MS / 1000.0, receivedSeekOffsets.get(0), 0.0001);
     }
 
     @Test

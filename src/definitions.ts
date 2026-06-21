@@ -48,6 +48,9 @@ export interface MediaSessionPlugin {
      * the MediaSession
      * interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler)
      * when using the Media Session API directly.
+     *
+     * Passing `null` as the handler removes a previously registered handler for
+     * that action.
      */
     setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void>;
     /**

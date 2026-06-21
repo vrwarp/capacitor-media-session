@@ -116,6 +116,19 @@ public class MediaSessionPluginTest {
         PluginCall call = mock(PluginCall.class);
         when(call.getString("action")).thenReturn(action);
         when(call.getCallbackId()).thenReturn("callback-" + action);
+        when(call.isKeptAlive()).thenReturn(true);
+        when(call.isReleased()).thenReturn(false);
+        when(call.getBoolean(eq("removeHandler"), any())).thenReturn(false);
+        return call;
+    }
+
+    private PluginCall mockRemoveHandlerCall(String action) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("action")).thenReturn(action);
+        when(call.getCallbackId()).thenReturn("remove-" + action);
+        when(call.isKeptAlive()).thenReturn(false);
+        when(call.isReleased()).thenReturn(false);
+        when(call.getBoolean(eq("removeHandler"), any())).thenReturn(true);
         return call;
     }
 
@@ -280,6 +293,83 @@ public class MediaSessionPluginTest {
         assertTrue(plugin.hasActionHandler("play"));
         assertTrue(player.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
         assertFalse(player.isCommandAvailable(Player.COMMAND_SEEK_TO_NEXT));
+    }
+
+    @Test
+    public void reRegisteringActionReleasesPreviousCallAndKeepsNewOneLive() {
+        PluginCall previousCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(previousCall);
+        idleMainLooper();
+
+        PluginCall newCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(newCall);
+        idleMainLooper();
+
+        // The previously stored kept-alive call must be released so it does not leak.
+        verify(previousCall).release(any());
+        verify(newCall).setKeepAlive(true);
+        // The new call is now the live handler.
+        plugin.actionCallback("play");
+        verify(newCall).resolve(any(JSObject.class));
+        verify(previousCall, never()).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void removeHandlerRemovesHandlerDropsCommandAndReleasesStoredCall() {
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+        assertTrue(player.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+
+        PluginCall removeCall = mockRemoveHandlerCall("play");
+        plugin.setActionHandler(removeCall);
+        idleMainLooper();
+
+        // The stored kept-alive call is released and the handler is gone.
+        verify(playCall).release(any());
+        assertFalse(plugin.hasActionHandler("play"));
+        assertFalse(player.isCommandAvailable(Player.COMMAND_PLAY_PAUSE));
+        // The removal call carries no live handler, so it resolves rather than being kept alive.
+        verify(removeCall).resolve();
+        verify(removeCall, never()).setKeepAlive(true);
+    }
+
+    @Test
+    public void removeHandlerForUnregisteredActionDoesNotThrowAndResolves() {
+        PluginCall removeCall = mockRemoveHandlerCall("seekforward");
+
+        plugin.setActionHandler(removeCall);
+        idleMainLooper();
+
+        assertFalse(plugin.hasActionHandler("seekforward"));
+        verify(removeCall).resolve();
+    }
+
+    @Test
+    public void setActionHandlerRejectsWhenActionMissing() {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("action")).thenReturn(null);
+
+        plugin.setActionHandler(call);
+
+        verify(call).reject("action is required");
+        verify(call, never()).setKeepAlive(true);
+    }
+
+    @Test
+    public void playerSeekForwardResolvesSeekforwardHandlerWithOffsetInSeconds() throws JSONException {
+        PluginCall seekForwardCall = mockActionHandlerCall("seekforward");
+        plugin.setActionHandler(seekForwardCall);
+        setPlaybackState("playing");
+
+        player.seekForward();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(seekForwardCall).resolve(captor.capture());
+        JSObject data = captor.getValue();
+        assertEquals("seekforward", data.getString("action"));
+        assertEquals(WebViewProxyPlayer.SEEK_FORWARD_INCREMENT_MS / 1000.0, data.getDouble("seekOffset"), 0.0001);
+        assertFalse(data.has("seekTime"));
     }
 
     @Test

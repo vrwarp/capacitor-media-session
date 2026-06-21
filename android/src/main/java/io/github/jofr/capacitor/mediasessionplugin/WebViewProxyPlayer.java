@@ -36,9 +36,19 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
 
     private static final String MEDIA_ID = "capacitor-media-session";
 
+    /**
+     * Amount, in milliseconds, by which "seekforward"/"seekbackward" move the playback position.
+     * These are reported to Media3 via {@link State.Builder#setSeekForwardIncrementMs}/
+     * {@link State.Builder#setSeekBackIncrementMs} and delivered to the JavaScript handler as
+     * {@code seekOffset} (in seconds) so the WebView can apply the same increment. A symmetric
+     * 10 s keeps behavior predictable across the notification, Bluetooth and hardware-key controls.
+     */
+    static final long SEEK_FORWARD_INCREMENT_MS = 10_000L;
+    static final long SEEK_BACK_INCREMENT_MS = 10_000L;
+
     /** Receives media session actions that should be handled by the JavaScript side. */
     public interface ActionCallback {
-        void onAction(String action, @Nullable Double seekTime);
+        void onAction(String action, @Nullable Double seekTime, @Nullable Double seekOffset);
     }
 
     /** Stable playlist UIDs ("previous" and "next" are placeholders, see {@link #getState()}). */
@@ -176,6 +186,8 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
             .setPlaylist(playlist)
             .setCurrentMediaItemIndex(currentItemIndex)
             .setContentPositionMs(positionSupplier)
+            .setSeekForwardIncrementMs(SEEK_FORWARD_INCREMENT_MS)
+            .setSeekBackIncrementMs(SEEK_BACK_INCREMENT_MS)
             .setPlaybackParameters(new PlaybackParameters(speed))
             .build();
     }
@@ -195,9 +207,9 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         return supportedActions.contains("previoustrack") ? 1 : 0;
     }
 
-    private void notifyAction(String action, @Nullable Double seekTime) {
+    private void notifyAction(String action, @Nullable Double seekTime, @Nullable Double seekOffset) {
         if (actionCallback != null) {
-            actionCallback.onAction(action, seekTime);
+            actionCallback.onAction(action, seekTime, seekOffset);
         } else {
             Log.d(TAG, "Dropping action " + action + " because no action callback is connected");
         }
@@ -211,7 +223,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         if (!playbackState.equals("none")) {
             playbackState = playWhenReady ? "playing" : "paused";
         }
-        notifyAction(playWhenReady ? "play" : "pause", null);
+        notifyAction(playWhenReady ? "play" : "pause", null, null);
         return Futures.immediateVoidFuture();
     }
 
@@ -220,21 +232,21 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         switch (seekCommand) {
             case Player.COMMAND_SEEK_TO_NEXT:
             case Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM:
-                notifyAction("nexttrack", null);
+                notifyAction("nexttrack", null, null);
                 break;
             case Player.COMMAND_SEEK_TO_PREVIOUS:
             case Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM:
-                notifyAction("previoustrack", null);
+                notifyAction("previoustrack", null, null);
                 break;
             case Player.COMMAND_SEEK_FORWARD:
-                notifyAction("seekforward", null);
+                notifyAction("seekforward", null, getSeekForwardIncrement() / 1000.0);
                 break;
             case Player.COMMAND_SEEK_BACK:
-                notifyAction("seekbackward", null);
+                notifyAction("seekbackward", null, getSeekBackIncrement() / 1000.0);
                 break;
             case Player.COMMAND_SEEK_TO_MEDIA_ITEM:
                 if (mediaItemIndex != getCurrentItemIndexInternal()) {
-                    notifyAction(mediaItemIndex > getCurrentItemIndexInternal() ? "nexttrack" : "previoustrack", null);
+                    notifyAction(mediaItemIndex > getCurrentItemIndexInternal() ? "nexttrack" : "previoustrack", null, null);
                     break;
                 }
                 // fall through: seek inside the current item
@@ -244,7 +256,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
                 // Optimistic update to keep the system seek bar from snapping back until
                 // JavaScript reports the new position via setPositionState().
                 position = seekTime;
-                notifyAction("seekto", seekTime);
+                notifyAction("seekto", seekTime, null);
                 break;
             default:
                 Log.d(TAG, "Unhandled seek command " + seekCommand);
@@ -257,7 +269,7 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
     protected ListenableFuture<?> handleStop() {
         // Intentionally no optimistic state change: JavaScript reacts to the "stop" action by
         // setting the playback state to "none", which is what actually tears the session down.
-        notifyAction("stop", null);
+        notifyAction("stop", null, null);
         return Futures.immediateVoidFuture();
     }
 

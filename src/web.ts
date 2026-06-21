@@ -21,7 +21,11 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
 
     async setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void> {
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.setActionHandler(options.action, handler);
+            try {
+                navigator.mediaSession.setActionHandler(options.action, handler);
+            } catch (e) {
+                throw this.unavailable(`Action "${options.action}" is not supported in this browser.`);
+            }
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }

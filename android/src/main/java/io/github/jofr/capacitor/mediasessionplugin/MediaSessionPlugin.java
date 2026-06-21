@@ -292,8 +292,31 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
     public void setActionHandler(PluginCall call) {
-        call.setKeepAlive(true);
         final String action = call.getString("action");
+        if (action == null || action.isEmpty()) {
+            call.reject("action is required");
+            return;
+        }
+
+        final boolean remove = call.getBoolean("removeHandler", false);
+
+        // Always release any previously stored kept-alive call for this action before replacing or
+        // removing it; otherwise re-registration would leak the old RETURN_CALLBACK PluginCall.
+        PluginCall previous = actionHandlers.remove(action);
+        if (previous != null && previous.isKeptAlive() && !previous.isReleased()) {
+            previous.release(getBridge());
+        }
+
+        if (remove) {
+            // This call carries no live JS handler (the null callback was translated into a
+            // removeHandler flag by the TS wrapper), so resolve it instead of keeping it alive.
+            Log.d(TAG, "setActionHandler: removed '" + action + "' supportedActions=" + actionHandlers.keySet());
+            updateServiceState();
+            call.resolve();
+            return;
+        }
+
+        call.setKeepAlive(true);
         actionHandlers.put(action, call);
         Log.d(TAG, "setActionHandler: registered '" + action + "' supportedActions=" + actionHandlers.keySet());
         updateServiceState();
@@ -304,10 +327,13 @@ public class MediaSessionPlugin extends Plugin {
         return call != null && !call.getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING);
     }
 
-    private void onPlayerAction(String action, Double seekTime) {
+    private void onPlayerAction(String action, Double seekTime, Double seekOffset) {
         JSObject data = new JSObject();
         if (seekTime != null) {
             data.put("seekTime", seekTime);
+        }
+        if (seekOffset != null) {
+            data.put("seekOffset", seekOffset);
         }
         actionCallback(action, data);
     }
