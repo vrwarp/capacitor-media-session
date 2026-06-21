@@ -435,3 +435,107 @@ the guard; the production release path itself is exercised via `verify(...).rele
 - **F3 (carried)** — arbitrary bitmap icons for custom actions (still limited to the curated built-in
   `CommandButton.ICON_*` set; no `iconUri`/custom drawable threading).
 - **R3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO).
+
+### Iteration 5 — read-back getters + addListener('action') event channel + custom-action args payload + destroyed-guard
+
+**Shipped** (addresses deferred **U4** read-back/events, **F-A/F5** custom-action args, plus a cheap
+**R-3** destroyed guard). ADDITIVE ONLY — the kept-alive `setActionHandler(options, handler)` per-tap
+delivery is byte-for-byte unchanged; the register-promise is still NOT settled on Android (settling it
+would break per-tap delivery — explicitly out of scope). No existing method signatures changed.
+
+- **U-1 — `addListener('action', cb)` event channel.** `actionCallback(String, JSObject)` now, AFTER
+  the existing guarded kept-alive handler resolve, ALSO emits `notifyListeners("action", event)`
+  **unconditionally** — so a listener fires on EVERY action (standard + custom) even when no
+  `setActionHandler` handler is registered. The emitted `event` is a fresh `JSObject` copy of `data`
+  (built by iterating `data.keys()` + `data.opt(key)`) with `action` set, so it does not alias the
+  exact `JSObject` handed to `call.resolve(data)`. Stays on the main looper (`actionCallback`'s
+  confinement thread). `addListener` itself is inherited from Capacitor's base `Plugin` (no override);
+  TS adds the `addListener(eventName: 'action', ...)` overload + imports `PluginListenerHandle` from
+  `@capacitor/core`. The `index.ts` Proxy forwards `addListener` + getters untouched via `Reflect.get`.
+- **U-1 — read-back getters (`getMetadata`/`getPlaybackState`/`getPositionState`).** New
+  `@PluginMethod` (RETURN_PROMISE) getters resolving the cached last-set values:
+  `getPlaybackState` → `{playbackState}`; `getMetadata` → `{title,artist,album}` (artwork OMITTED —
+  only decoded bytes are cached natively); `getPositionState` → `{duration,position,playbackRate}`.
+  Documented SAME-BRIDGE-THREAD invariant: they run on the bridge thread and read only fields WRITTEN
+  on the same bridge thread by the setters (NOT the main-written `artworkData`), so no synchronization.
+  Web getters read minimal caches (`metadataCache`/`playbackStateCache`/`positionStateCache`, MERGE for
+  metadata/position so omitted fields preserve, assign for playback state), enriched from
+  `navigator.mediaSession` where present (metadata fields; playbackState fallback when still `none`).
+- **F-1 — custom-action args payload.** New `MediaSessionService.bundleToJSObject(Bundle)` marshals a
+  command's args `Bundle` into a `JSObject` (String/boolean/int/long/double/float overloads; null
+  values skipped; `String.valueOf(...)` fallback). `onCustomCommand` now passes
+  `bundleToJSObject(args)` (folding in any non-empty `sessionCommand.customExtras`, with the controller
+  args taking precedence) instead of `new JSObject()` → flows through
+  `plugin.actionCallback(customAction, data)` → both the kept-alive handler and the new listener →
+  surfaces as `ActionDetails.data` in JS. TS: added `data?: { [key: string]: any }` to `ActionDetails`.
+  No `actionCallback` signature change.
+- **R-3 — cheap destroyed guard.** New `private volatile boolean destroyed = false;`. Checked
+  (`if (destroyed) return;`) at the top of the `setMetadata` main-post body AND the artwork
+  result-delivery runnable, so a teardown between post and run drops work that would touch a released
+  player/state. `handleOnDestroy` now sets `destroyed=true` and calls
+  `mainHandler.removeCallbacksAndMessages(null)` BEFORE `artworkExecutor.shutdownNow()`/`stopMediaService()`.
+
+**Files changed**
+
+- `src/definitions.ts` — `PluginListenerHandle` import; `ActionDetails.data`; three getter signatures
+  + `addListener('action')` overload (full JSDoc); `setActionHandler` JSDoc appended with the
+  Android keep-alive / don't-await note.
+- `src/web.ts` — three caches + getter implementations; `setActionHandler` wraps the user handler so
+  the navigator handler ALSO `notifyListeners('action', ...)` (user handler still fires first); the
+  iter-1 try/catch + iter-2 standard-action gate intact; `toActionDetails` mapper.
+- `src/index.ts` — comment only (verified `addListener`/getters forward via `Reflect.get`).
+- `android/.../MediaSessionPlugin.java` — three getter `@PluginMethod`s; unconditional additive
+  `notifyListeners("action", ...)` in `actionCallback`; `destroyed` field + guards + `handleOnDestroy`
+  ordering.
+- `android/.../MediaSessionService.java` — `bundleToJSObject`; `onCustomCommand` marshals args+extras.
+- `android/.../MediaSessionPluginTest.java`, `MediaSessionServiceTest.java` — new tests (below).
+- `example/src/js/media-session.js` — `addListener('action')` + `getPlaybackState()` readback demo.
+- `example/tests/media-session.test.js` — extended the `vi.mock` (option A) with `addListener` +
+  getter mocks; +2 tests.
+- `README.md` — regenerated by docgen (new getters, `addListener` overload, `ActionDetails.data`); the
+  hand-written "Custom actions (Android)" prose survived and a new hand-written "Listening for actions
+  and reading state back" subsection was added above `<docgen-index>`.
+
+**Test cases added** (Android +12, example +2)
+
+- `MediaSessionPluginTest` (43 → 52): `getPlaybackStateReturnsCachedState`,
+  `getMetadataReturnsCachedTextFields` (asserts `has("artwork")` false), `getPositionStateReturnsCachedValues`,
+  `getPositionStateReturnsDefaultsBeforeAnySet` (0/0/1 preserve/default case), `addListenerReceivesActionEvent`
+  (listener + separate handler both fire; handler still `times(1)`), `addListenerReceivesActionEventWithNoHandlerRegistered`
+  (event fires with NO handler), `actionEventCarriesCustomArgs` (data int/bool/string surfaced),
+  `destroyedGuardDropsLateArtwork` (R-3: latch-blocked fetcher, `handleOnDestroy()`, release+idle, no NPE,
+  service torn down), `existingHandlerStillResolvesExactlyOnceWithListenerRegistered`. New helper
+  `mockListenerCall(eventName)` (stubs the base-Plugin `addListener` contract on a SEPARATE mock from the
+  handler mock, so existing `times(1)` handler-resolve assertions still hold).
+- `MediaSessionServiceTest` (9 → 12): `onCustomCommandMarshalsArgsToPlugin`
+  (`setPlugin(mock)`, drive `onCustomCommand` with a String+boolean+int bundle, `verify(mockPlugin).actionCallback(eq("like"), captor)`,
+  assert marshaled keys/types, future yields RESULT_SUCCESS), `bundleToJSObjectCoversCommonTypes`
+  (String/boolean/int/long/double/float + null-skip), `bundleToJSObjectHandlesNullBundle`.
+
+**Verification — all three gates green**
+
+- Web (root build): `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0); README
+  regenerated, both hand-written prose subsections survived.
+- Android: `cd android && ./gradlew test` → `BUILD SUCCESSFUL`; **110 tests, 0 failures / 0 errors**
+  (ArtworkScalingTest 5, ArtworkSelectionTest 13, MediaSessionPluginTest 52, MediaSessionServiceTest 12,
+  WebViewProxyPlayerTest 28).
+- Example: `cd example && npm test` (vitest) → **17 tests passed** (1 file); deps already installed.
+
+**Deviation from plan** — minor: the `destroyedGuardDropsLateArtwork` test does NOT assert
+`awaitArtworkIdle(...)` after `handleOnDestroy()`, because `handleOnDestroy` calls
+`artworkExecutor.shutdownNow()`, after which submitting the barrier task would be rejected (returns
+false). The test instead releases the gate, idles the main looper and asserts no exception + the
+service was torn down (`service == null`) — which is exactly the R-3 guarantee. JSDoc avoids `{@link}`
+cross-references in the new interface docs because this docgen version renders them literally in the
+README; plain backticked prose is used instead (consistent with the rest of the file).
+
+**Deferred (seeds for the next critic)**
+
+- **R-1** — service-confinement: `MediaSessionService` session/layout mutation and the plugin's
+  main-looper confinement are separate disciplines; a single explicit confinement contract across the
+  plugin↔service boundary is still informal.
+- **F-3 (carried)** — arbitrary bitmap icons for custom actions (`iconUri`/custom drawable threading;
+  still limited to the curated built-in `CommandButton.ICON_*` set).
+- **R3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO).
+- **R-2** — service teardown debounce: rapid `playing`↔`none` transitions bind/unbind/stop the service
+  repeatedly with no debounce; a short settle window would avoid churn.

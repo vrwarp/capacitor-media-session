@@ -104,4 +104,18 @@ export function setupMediaSession(audioElement) {
         );
     };
     registerLike();
+
+    // Event channel: addListener('action', ...) fires on EVERY media action (standard + custom),
+    // in addition to any setActionHandler handler. Unlike setActionHandler (kept alive on Android),
+    // this resolves with a PluginListenerHandle you can await/remove. The details include the
+    // custom-action `data` payload on Android.
+    MediaSession.addListener('action', (details) => {
+        console.log('media-session action:', details.action, details.data ?? {});
+    });
+
+    // Read-back getter demo: getPlaybackState/getMetadata/getPositionState return the last values
+    // set (the plugin's own cache), useful for resyncing UI after a resume.
+    MediaSession.getPlaybackState().then((state) => {
+        console.log('current playback state:', state.playbackState);
+    });
 }

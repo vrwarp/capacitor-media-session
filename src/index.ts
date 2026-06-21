@@ -10,9 +10,12 @@ const MediaSessionNative = registerPlugin<MediaSessionPlugin>('MediaSession', {
 // The Capacitor native bridge drops a `null` callback argument, so the native
 // (Android) implementation cannot otherwise tell that a handler should be
 // removed. Translate `handler === null` into a serializable `removeHandler`
-// flag while keeping the public signature unchanged. All other methods are
-// delegated unchanged. The web/iOS implementation forwards `null` to
-// `navigator.mediaSession` directly and ignores `removeHandler`.
+// flag while keeping the public signature unchanged. All other methods —
+// including `addListener('action')` and the `getMetadata`/`getPlaybackState`/
+// `getPositionState` read-back getters — are delegated unchanged via
+// `Reflect.get`, returning the native `PluginListenerHandle` / cached value. The
+// web/iOS implementation forwards `null` to `navigator.mediaSession` directly and
+// ignores `removeHandler`.
 const MediaSession: MediaSessionPlugin = new Proxy(MediaSessionNative, {
   get(target, prop, receiver) {
     if (prop === 'setActionHandler') {

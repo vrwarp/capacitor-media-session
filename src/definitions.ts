@@ -1,3 +1,5 @@
+import type { PluginListenerHandle } from '@capacitor/core';
+
 export interface MetadataOptions {
     album?: string;
     artist?: string;
@@ -70,6 +72,14 @@ export interface ActionDetails {
     action: MediaSessionAction | string;
     seekOffset?: number | null;
     seekTime?: number | null;
+    /**
+     * Extra per-tap data for the action. On Android this carries the *custom
+     * action* arguments/extras: the `Bundle` passed by the controller for a
+     * custom command (and any `customExtras` configured on the command) is
+     * marshalled into this object (string/boolean/number values). Standard
+     * actions do not populate this field; on Web/iOS it is unused.
+     */
+    data?: { [key: string]: any };
 }
 
 export interface PositionStateOptions {
@@ -119,8 +129,56 @@ export interface MediaSessionPlugin {
      * replaces the button, and passing `null` removes it. Custom actions are a
      * silent no-op on Web and iOS, where only the standard actions are
      * supported.
+     *
+     * **Android promise behaviour:** the returned promise does **not** settle on
+     * registration — the underlying call is kept alive to deliver every tap to
+     * `handler`. Do **not** `await` it on Android (it would hang). If you only
+     * want to know an action fired (rather than registering a per-action
+     * handler), prefer `addListener('action', ...)`, whose promise settles
+     * idiomatically.
      */
     setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void>;
+    /**
+     * Returns the last metadata set via `setMetadata`. This is a read-back of
+     * the plugin's own cached value (the most recently set fields), **not** a
+     * live read of the underlying system media session.
+     *
+     * On Web the cache is enriched from `navigator.mediaSession.metadata` when
+     * available. On Android only the **text** fields (`title`, `artist`,
+     * `album`) are returned; `artwork` is omitted because only the decoded image
+     * bytes are cached natively, not the original `artwork` array.
+     */
+    getMetadata(): Promise<MetadataOptions>;
+    /**
+     * Returns the last playback state set via `setPlaybackState` (defaults to
+     * `"none"`). This is a read-back of the plugin's own cached value, **not** a
+     * live read of the underlying system media session. On Web the value falls
+     * back to `navigator.mediaSession.playbackState` when no value has been set
+     * yet.
+     */
+    getPlaybackState(): Promise<PlaybackStateOptions>;
+    /**
+     * Returns the last position state set via `setPositionState` (`duration`,
+     * `position`, `playbackRate`). This is a read-back of the plugin's own
+     * cached value, **not** a live read of the underlying system media session.
+     */
+    getPositionState(): Promise<PositionStateOptions>;
+    /**
+     * Adds a listener that fires on **every** media action (standard *and*
+     * custom) the user triggers — system media controls, hardware media buttons
+     * or a custom-action button. This fires **in addition to** any handler
+     * registered for the same action via `setActionHandler`; both are invoked.
+     *
+     * Unlike `setActionHandler` (whose promise is kept alive on Android), the
+     * promise returned here settles idiomatically with a `PluginListenerHandle`
+     * you can `await` and later `remove()`. The listener receives the same
+     * `ActionDetails` shape as a handler, including the custom-action `data`
+     * payload.
+     */
+    addListener(
+        eventName: 'action',
+        listenerFunc: (details: ActionDetails) => void,
+    ): Promise<PluginListenerHandle>;
     /**
      * Update current media playback position, duration and speed. Analogue to
      * calling [setPositionState() of the MediaSession

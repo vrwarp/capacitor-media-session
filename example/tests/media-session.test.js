@@ -6,6 +6,10 @@ vi.mock('@jofr/capacitor-media-session', () => ({
     setPlaybackState: vi.fn().mockResolvedValue(undefined),
     setPositionState: vi.fn().mockResolvedValue(undefined),
     setActionHandler: vi.fn().mockResolvedValue(undefined),
+    addListener: vi.fn().mockResolvedValue({ remove: vi.fn() }),
+    getMetadata: vi.fn().mockResolvedValue({}),
+    getPlaybackState: vi.fn().mockResolvedValue({ playbackState: 'none' }),
+    getPositionState: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -191,6 +195,17 @@ describe('setupMediaSession', () => {
 
     expect(audio.pause).toHaveBeenCalled();
     expect(lastPlaybackState()).toBe('none');
+  });
+
+  it('registers an "action" event listener', () => {
+    expect(MediaSession.addListener).toHaveBeenCalledWith(
+      'action',
+      expect.any(Function),
+    );
+  });
+
+  it('reads back the current playback state on setup', () => {
+    expect(MediaSession.getPlaybackState).toHaveBeenCalled();
   });
 
   it('toggles the "like" custom action label and icon', () => {

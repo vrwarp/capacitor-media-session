@@ -217,6 +217,41 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     }
 
     /**
+     * Marshals a custom-command {@link Bundle} into a {@link JSObject} so the per-tap arguments reach
+     * JS as {@code ActionDetails.data}. Each key is copied via the matching {@code JSObject.put}
+     * overload (String, boolean, int/long, double/float); null values are skipped and any other type
+     * falls back to {@code String.valueOf(...)}. A null/empty bundle yields an empty object.
+     */
+    static JSObject bundleToJSObject(@Nullable Bundle args) {
+        JSObject obj = new JSObject();
+        if (args == null) {
+            return obj;
+        }
+        for (String key : args.keySet()) {
+            Object value = args.get(key);
+            if (value == null) {
+                continue;
+            }
+            if (value instanceof String) {
+                obj.put(key, (String) value);
+            } else if (value instanceof Boolean) {
+                obj.put(key, (Boolean) value);
+            } else if (value instanceof Integer) {
+                obj.put(key, (Integer) value);
+            } else if (value instanceof Long) {
+                obj.put(key, (Long) value);
+            } else if (value instanceof Double) {
+                obj.put(key, (Double) value);
+            } else if (value instanceof Float) {
+                obj.put(key, (Float) value);
+            } else {
+                obj.put(key, String.valueOf(value));
+            }
+        }
+        return obj;
+    }
+
+    /**
      * Builds a Media3 {@link CommandButton} for one custom action. The icon is passed as a built-in
      * {@link CommandButton} {@code ICON_*} constant (Media3 resolves the bundled drawable); an
      * {@code ICON_UNDEFINED} spec yields a button without a built-in icon.
@@ -310,7 +345,21 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
                 @NonNull Bundle args) {
             MediaSessionPlugin plugin = MediaSessionService.this.plugin;
             if (plugin != null && sessionCommand.customAction != null && !sessionCommand.customAction.isEmpty()) {
-                plugin.actionCallback(sessionCommand.customAction, new JSObject());
+                // Marshal the controller-supplied args bundle (and any extras baked into the
+                // command) into the per-tap data payload that surfaces as ActionDetails.data in JS.
+                JSObject data = bundleToJSObject(args);
+                Bundle extras = sessionCommand.customExtras;
+                if (extras != null && !extras.isEmpty()) {
+                    JSObject extrasData = bundleToJSObject(extras);
+                    for (java.util.Iterator<String> it = extrasData.keys(); it.hasNext(); ) {
+                        String key = it.next();
+                        // The controller args bundle takes precedence over the command's seed extras.
+                        if (!data.has(key)) {
+                            data.put(key, extrasData.opt(key));
+                        }
+                    }
+                }
+                plugin.actionCallback(sessionCommand.customAction, data);
             } else {
                 Log.w(TAG, "onCustomCommand: no plugin or empty customAction — dropping '"
                         + sessionCommand.customAction + "'");

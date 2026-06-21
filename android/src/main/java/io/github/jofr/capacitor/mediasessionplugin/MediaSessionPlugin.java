@@ -91,6 +91,14 @@ public class MediaSessionPlugin extends Plugin {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     /**
+     * Set once in {@link #handleOnDestroy}. Read on the main looper by late artwork-delivery and
+     * {@code setMetadata} runnables to drop work that would touch a torn-down player/state.
+     * {@code volatile} because it is written from the destroy path and read from main-looper
+     * runnables.
+     */
+    private volatile boolean destroyed = false;
+
+    /**
      * Loads encoded cover art bytes for a given artwork {@code src}. Indirection over
      * {@link #urlToArtworkData} so tests can inject a deterministic fetcher (no real network) — not
      * a public/plugin API.
@@ -455,6 +463,10 @@ public class MediaSessionPlugin extends Plugin {
         // bridge thread — the promise must NOT wait for the (possibly slow) network fetch.
         final List<JSONObject> artworkList = artworkArray.toList();
         mainHandler.post(() -> {
+            if (destroyed) {
+                // Plugin torn down between posting and running: do not touch the (released) player/state.
+                return;
+            }
             final long generation = ++artworkGeneration;
             final String src = selectArtworkSrc(artworkList, MAX_ARTWORK_DIMENSION);
             // Reflect the text update immediately (artwork may change again below / shortly after).
@@ -476,6 +488,11 @@ public class MediaSessionPlugin extends Plugin {
                 }
                 final byte[] result = data;
                 mainHandler.post(() -> {
+                    if (destroyed) {
+                        // Plugin torn down while the fetch was in flight; drop the late result so it
+                        // never touches a released player/state (R-3 destroyed guard).
+                        return;
+                    }
                     if (generation != artworkGeneration) {
                         // A newer artwork request superseded this one; discard the stale result.
                         return;
@@ -516,6 +533,59 @@ public class MediaSessionPlugin extends Plugin {
 
         updateServiceState();
         call.resolve();
+    }
+
+    /**
+     * Read-back getter for the cached playback state. Returns the last value set via
+     * {@link #setPlaybackState} (not a live read of the system session).
+     *
+     * <p>SAME-BRIDGE-THREAD invariant: this runs on the Capacitor bridge thread and reads
+     * {@code playbackState}, which is WRITTEN on the same bridge thread by {@link #setPlaybackState}.
+     * Because every {@code @PluginMethod} runs on one shared background HandlerThread, the read and
+     * write are serialized on that single thread, so no synchronization is needed.
+     */
+    @PluginMethod
+    public void getPlaybackState(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("playbackState", playbackState);
+        call.resolve(result);
+    }
+
+    /**
+     * Read-back getter for the cached metadata TEXT fields. Returns the last {@code title}/
+     * {@code artist}/{@code album} set via {@link #setMetadata}; {@code artwork} is intentionally
+     * OMITTED because only decoded image bytes are cached natively, not the original artwork array.
+     *
+     * <p>SAME-BRIDGE-THREAD invariant: runs on the Capacitor bridge thread and reads
+     * {@code title}/{@code artist}/{@code album}, all WRITTEN on the same bridge thread by
+     * {@link #setMetadata}. {@code artworkData} (written on the MAIN looper) is deliberately NOT read
+     * here, so this getter stays single-thread-confined and needs no synchronization.
+     */
+    @PluginMethod
+    public void getMetadata(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("title", title);
+        result.put("artist", artist);
+        result.put("album", album);
+        call.resolve(result);
+    }
+
+    /**
+     * Read-back getter for the cached position state. Returns the last {@code duration}/
+     * {@code position}/{@code playbackRate} set via {@link #setPositionState}.
+     *
+     * <p>SAME-BRIDGE-THREAD invariant: runs on the Capacitor bridge thread and reads
+     * {@code duration}/{@code position}/{@code playbackRate}, all WRITTEN on the same bridge thread by
+     * {@link #setPositionState}; serialized on the single shared HandlerThread, so no synchronization
+     * is needed.
+     */
+    @PluginMethod
+    public void getPositionState(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("duration", duration);
+        result.put("position", position);
+        result.put("playbackRate", playbackRate);
+        call.resolve(result);
     }
 
     /**
@@ -658,10 +728,30 @@ public class MediaSessionPlugin extends Plugin {
             Log.w(TAG, "actionCallback DROPPED: no live handler for '" + action
                     + "' (registration race, released, or never registered) — control will do nothing");
         }
+
+        // ADDITIVE event channel: emit 'action' UNCONDITIONALLY so addListener('action', cb) receives
+        // EVERY action (standard + custom) even when no kept-alive setActionHandler handler is
+        // registered. This is in ADDITION to the kept-alive handler resolve above; the keep-alive
+        // per-tap delivery is unchanged. Build a fresh copy so we do not alias the exact JSObject
+        // handed to call.resolve(data) above (Capacitor may consume/serialize it). Already on the main
+        // looper (actionCallback's confinement thread / onPlayerAction posts here).
+        JSObject event = new JSObject();
+        for (java.util.Iterator<String> it = data.keys(); it.hasNext(); ) {
+            String key = it.next();
+            event.put(key, data.opt(key));
+        }
+        event.put("action", action);
+        notifyListeners("action", event);
     }
 
     @Override
     protected void handleOnDestroy() {
+        // R-3 destroyed guard: flip the flag first so any already-queued main-looper runnable (a
+        // pending setMetadata post or a late artwork result-delivery) drops its work instead of
+        // touching the released player/state. Then clear pending main-looper callbacks BEFORE
+        // shutting down the artwork executor / stopping the service, so nothing re-posts afterwards.
+        destroyed = true;
+        mainHandler.removeCallbacksAndMessages(null);
         artworkExecutor.shutdownNow();
         stopMediaService();
         super.handleOnDestroy();

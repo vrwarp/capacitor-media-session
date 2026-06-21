@@ -11,6 +11,7 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyFloat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -149,6 +150,19 @@ public class MediaSessionPluginTest {
         when(call.isKeptAlive()).thenReturn(true);
         when(call.isReleased()).thenReturn(false);
         when(call.getBoolean(eq("removeHandler"), any())).thenReturn(false);
+        return call;
+    }
+
+    /**
+     * Mock PluginCall standing in for an {@code addListener('action', cb)} registration: the base
+     * {@link com.getcapacitor.Plugin#addListener} reads {@code eventName} and keeps the call alive.
+     */
+    private PluginCall mockListenerCall(String eventName) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("eventName")).thenReturn(eventName);
+        when(call.getCallbackId()).thenReturn("listener-" + eventName);
+        when(call.isKeptAlive()).thenReturn(true);
+        when(call.isReleased()).thenReturn(false);
         return call;
     }
 
@@ -955,5 +969,180 @@ public class MediaSessionPluginTest {
         // The released first call is never resolved by the post-swap tap; the second one is.
         verify(first, times(1)).resolve(any(JSObject.class));
         verify(second, times(1)).resolve(any(JSObject.class));
+    }
+
+    // --- Read-back getters (U-1) --------------------------------------------------------------
+
+    @Test
+    public void getPlaybackStateReturnsCachedState() {
+        setPlaybackState("playing");
+
+        PluginCall call = mock(PluginCall.class);
+        plugin.getPlaybackState(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        assertEquals("playing", captor.getValue().getString("playbackState"));
+    }
+
+    @Test
+    public void getMetadataReturnsCachedTextFields() throws JSONException {
+        PluginCall setCall = mock(PluginCall.class);
+        when(setCall.getString(eq("title"), anyString())).thenReturn("Song Title");
+        when(setCall.getString(eq("artist"), anyString())).thenReturn("Song Artist");
+        when(setCall.getString(eq("album"), anyString())).thenReturn("Song Album");
+        when(setCall.getArray("artwork")).thenReturn(null);
+        plugin.setMetadata(setCall);
+        idleMainLooper();
+
+        PluginCall call = mock(PluginCall.class);
+        plugin.getMetadata(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        JSObject result = captor.getValue();
+        assertEquals("Song Title", result.getString("title"));
+        assertEquals("Song Artist", result.getString("artist"));
+        assertEquals("Song Album", result.getString("album"));
+        // Artwork is intentionally omitted (only decoded bytes are cached natively).
+        assertFalse(result.has("artwork"));
+    }
+
+    @Test
+    public void getPositionStateReturnsCachedValues() throws JSONException {
+        PluginCall setCall = mock(PluginCall.class);
+        when(setCall.getDouble(eq("duration"), anyDouble())).thenReturn(180.0);
+        when(setCall.getDouble(eq("position"), anyDouble())).thenReturn(42.0);
+        when(setCall.getFloat(eq("playbackRate"), anyFloat())).thenReturn(1.5f);
+        plugin.setPositionState(setCall);
+        idleMainLooper();
+
+        PluginCall call = mock(PluginCall.class);
+        plugin.getPositionState(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        JSObject result = captor.getValue();
+        assertEquals(180.0, result.getDouble("duration"), 0.0001);
+        assertEquals(42.0, result.getDouble("position"), 0.0001);
+        assertEquals(1.5, result.getDouble("playbackRate"), 0.0001);
+    }
+
+    @Test
+    public void getPositionStateReturnsDefaultsBeforeAnySet() throws JSONException {
+        // No setPositionState yet: the cached defaults (0/0/1) are returned.
+        PluginCall call = mock(PluginCall.class);
+        plugin.getPositionState(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        JSObject result = captor.getValue();
+        assertEquals(0.0, result.getDouble("duration"), 0.0001);
+        assertEquals(0.0, result.getDouble("position"), 0.0001);
+        assertEquals(1.0, result.getDouble("playbackRate"), 0.0001);
+    }
+
+    // --- addListener('action') event channel (U-1) --------------------------------------------
+
+    @Test
+    public void addListenerReceivesActionEvent() throws JSONException {
+        // Register an 'action' listener AND a separate setActionHandler handler: both fire.
+        PluginCall listenerCall = mockListenerCall("action");
+        plugin.addListener(listenerCall);
+
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+
+        plugin.actionCallback("play", new JSObject());
+
+        // The kept-alive handler still resolves exactly once (per-tap delivery unchanged)...
+        verify(playCall, times(1)).resolve(any(JSObject.class));
+        // ...and the listener ALSO receives the action event.
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        assertEquals("play", captor.getValue().getString("action"));
+    }
+
+    @Test
+    public void addListenerReceivesActionEventWithNoHandlerRegistered() throws JSONException {
+        // No setActionHandler handler at all: the event channel must STILL fire (unconditional emit).
+        PluginCall listenerCall = mockListenerCall("action");
+        plugin.addListener(listenerCall);
+
+        plugin.actionCallback("pause", new JSObject());
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        assertEquals("pause", captor.getValue().getString("action"));
+    }
+
+    @Test
+    public void actionEventCarriesCustomArgs() throws JSONException {
+        PluginCall listenerCall = mockListenerCall("action");
+        plugin.addListener(listenerCall);
+
+        JSObject data = new JSObject();
+        data.put("count", 3);
+        data.put("flag", true);
+        data.put("name", "value");
+        plugin.actionCallback("like", data);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        JSObject event = captor.getValue();
+        assertEquals("like", event.getString("action"));
+        assertEquals(3, event.getInt("count"));
+        assertTrue(event.getBoolean("flag"));
+        assertEquals("value", event.getString("name"));
+    }
+
+    // --- R-3 destroyed guard ------------------------------------------------------------------
+
+    @Test
+    public void destroyedGuardDropsLateArtwork() throws Exception {
+        // A latch-blocked fetcher keeps the artwork result in flight while the plugin is destroyed.
+        CountDownLatch fetchGate = new CountDownLatch(1);
+        plugin.setArtworkFetcher(src -> {
+            try {
+                fetchGate.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FIXED_ARTWORK_BYTES;
+        });
+
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/cover.png");
+        plugin.setMetadata(call);
+        idleMainLooper(); // run selection -> submits the (blocked) fetch
+
+        // Tear the plugin down while the fetch is still gated: must not throw. handleOnDestroy sets the
+        // destroyed flag, removes pending main-looper callbacks, then shuts the executor down (which
+        // interrupts the blocked fetch).
+        plugin.handleOnDestroy();
+
+        // Release the gate (the fetch was interrupted by shutdownNow, but unblock it defensively) and
+        // idle: any late result-delivery runnable that still slipped onto the looper must be dropped by
+        // the destroyed guard without an NPE touching the released player/state.
+        fetchGate.countDown();
+        idleMainLooper();
+        // Reaching here without an exception is the assertion; the service was torn down too.
+        assertNull(getPluginField("service"));
+    }
+
+    @Test
+    public void existingHandlerStillResolvesExactlyOnceWithListenerRegistered() throws JSONException {
+        // Guards the additive emit: with BOTH a listener and a handler, the handler-resolve count is
+        // still exactly one (separate mocks — the times(1) handler assertions elsewhere still hold).
+        PluginCall listenerCall = mockListenerCall("action");
+        plugin.addListener(listenerCall);
+        PluginCall playCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(playCall);
+        idleMainLooper();
+
+        plugin.actionCallback("play");
+
+        verify(playCall, times(1)).resolve(any(JSObject.class));
+        verify(listenerCall, atLeastOnce()).resolve(any(JSObject.class));
     }
 }
