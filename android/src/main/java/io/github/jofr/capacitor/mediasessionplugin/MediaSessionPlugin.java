@@ -27,11 +27,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import io.github.jofr.capacitor.mediasessionplugin.CustomActions.CustomActionSpec;
 
 @CapacitorPlugin(name = "MediaSession")
 public class MediaSessionPlugin extends Plugin {
@@ -60,6 +64,13 @@ public class MediaSessionPlugin extends Plugin {
     private double playbackRate = 1.0;
     private final Map<String, PluginCall> actionHandlers = new HashMap<>();
 
+    /**
+     * Custom-action button specs (id -> label + resolved icon) for actions that are not standard
+     * Media Session actions. Insertion-ordered so the published custom layout is deterministic.
+     * Kept in parallel with {@link #actionHandlers} and maintained on register/re-register/remove.
+     */
+    private final Map<String, CustomActionSpec> customActions = new LinkedHashMap<>();
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private MediaSessionService service = null;
@@ -71,11 +82,14 @@ public class MediaSessionPlugin extends Plugin {
             Log.i(TAG, "onServiceConnected: binding proxy player action callback and pushing state");
             MediaSessionService.LocalBinder binder = (MediaSessionService.LocalBinder) iBinder;
             service = binder.getService();
+            service.setPlugin(MediaSessionPlugin.this);
             WebViewProxyPlayer player = service.getPlayer();
             if (player != null) {
                 player.setActionCallback(MediaSessionPlugin.this::onPlayerAction);
             }
             updateServiceState();
+            // Replay any custom actions registered before the service bound.
+            updateCustomLayout();
         }
 
         @Override
@@ -140,7 +154,14 @@ public class MediaSessionPlugin extends Plugin {
         final double duration = this.duration;
         final double position = this.position;
         final double playbackRate = this.playbackRate;
-        final Set<String> supportedActions = new HashSet<>(actionHandlers.keySet());
+        // Only the standard actions map to Player.Commands; custom actions are surfaced separately
+        // as session custom-layout buttons, so they must not reach the proxy player's command switch.
+        final Set<String> supportedActions = new HashSet<>();
+        for (String action : actionHandlers.keySet()) {
+            if (CustomActions.isStandard(action)) {
+                supportedActions.add(action);
+            }
+        }
 
         mainHandler.post(() -> {
             MediaSessionService service = this.service;
@@ -299,6 +320,7 @@ public class MediaSessionPlugin extends Plugin {
         }
 
         final boolean remove = call.getBoolean("removeHandler", false);
+        final boolean custom = CustomActions.isCustom(action);
 
         // Always release any previously stored kept-alive call for this action before replacing or
         // removing it; otherwise re-registration would leak the old RETURN_CALLBACK PluginCall.
@@ -310,16 +332,50 @@ public class MediaSessionPlugin extends Plugin {
         if (remove) {
             // This call carries no live JS handler (the null callback was translated into a
             // removeHandler flag by the TS wrapper), so resolve it instead of keeping it alive.
+            if (custom) {
+                customActions.remove(action);
+            }
             Log.d(TAG, "setActionHandler: removed '" + action + "' supportedActions=" + actionHandlers.keySet());
             updateServiceState();
+            updateCustomLayout();
             call.resolve();
             return;
+        }
+
+        if (custom) {
+            // Re-registering replaces the existing entry; remove first so the LinkedHashMap re-inserts
+            // it at the end (toggle), then store the latest label/icon.
+            customActions.remove(action);
+            final String label = call.getString("label");
+            final int iconConstant = CustomActions.iconConstant(call.getString("icon"));
+            customActions.put(action, new CustomActionSpec(action, label, iconConstant));
         }
 
         call.setKeepAlive(true);
         actionHandlers.put(action, call);
         Log.d(TAG, "setActionHandler: registered '" + action + "' supportedActions=" + actionHandlers.keySet());
         updateServiceState();
+        if (custom) {
+            updateCustomLayout();
+        }
+    }
+
+    /**
+     * Pushes the current ordered custom-action specs to the service on the main thread so it can
+     * rebuild the session's custom layout. Guarded like {@link #updateServiceState}: if the service
+     * is not bound yet, the actions are replayed from {@code onServiceConnected}.
+     */
+    private void updateCustomLayout() {
+        final List<CustomActionSpec> specs = new ArrayList<>(customActions.values());
+        mainHandler.post(() -> {
+            MediaSessionService service = this.service;
+            if (service == null) {
+                Log.w(TAG, "updateCustomLayout: service not bound yet — dropping " + specs.size()
+                        + " custom action(s) (will replay on connect)");
+                return;
+            }
+            service.updateCustomActions(specs);
+        });
     }
 
     public boolean hasActionHandler(String action) {

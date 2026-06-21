@@ -51,6 +51,15 @@ public class MediaSessionServiceTest {
     }
 
     @Test
+    public void freshServiceHasEmptyCustomLayoutAndSessionCallback() {
+        // No custom actions registered yet: the session's custom layout starts empty and a session
+        // callback is attached so custom-command taps can be routed back to the plugin.
+        assertNotNull(service.getMediaSession());
+        assertTrue(service.getMediaSession().getCustomLayout().isEmpty());
+        assertNotNull(service.getSessionCallback());
+    }
+
+    @Test
     public void localBindReturnsLocalBinder() {
         Intent intent = new Intent(service, MediaSessionService.class);
 
