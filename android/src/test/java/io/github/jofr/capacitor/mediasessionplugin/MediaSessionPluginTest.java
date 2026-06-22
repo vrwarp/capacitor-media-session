@@ -5,6 +5,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
@@ -55,6 +56,7 @@ import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.android.controller.ServiceController;
 import org.robolectric.annotation.Config;
+import org.robolectric.shadows.ShadowApplication;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -88,11 +90,17 @@ public class MediaSessionPluginTest {
         service = serviceController.get();
         player = service.getPlayer();
 
+        // Register the real local binder with the ShadowApplication so a real bindService() (e.g. a
+        // rebind after a debounced teardown in the R-2 tests) drives onServiceConnected with the live
+        // binder instead of Robolectric's default null binder.
+        ComponentName serviceComponent = new ComponentName(context, MediaSessionService.class);
+        IBinder binder = service.onBind(new Intent(context, MediaSessionService.class));
+        ShadowApplication.getInstance().setComponentNameAndServiceForBindService(serviceComponent, binder);
+
         // Connect the plugin to the service the same way Android would after bindService():
         // through the local binder handed out for intents without an action.
-        IBinder binder = service.onBind(new Intent(context, MediaSessionService.class));
         ServiceConnection connection = getServiceConnection();
-        connection.onServiceConnected(new ComponentName(context, MediaSessionService.class), binder);
+        connection.onServiceConnected(serviceComponent, binder);
         idleMainLooper();
     }
 
@@ -122,8 +130,24 @@ public class MediaSessionPluginTest {
         field.set(plugin, value);
     }
 
+    /** Reads the private static {@code SERVICE_TEARDOWN_DELAY_MS} constant via reflection. */
+    private static long SERVICE_TEARDOWN_DELAY_MS() {
+        try {
+            Field field = MediaSessionPlugin.class.getDeclaredField("SERVICE_TEARDOWN_DELAY_MS");
+            field.setAccessible(true);
+            return field.getLong(null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static void idleMainLooper() {
         shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    /** Advances the main looper by {@code ms}, running any {@code postDelayed} callbacks now due. */
+    private static void idleMainFor(long ms) {
+        shadowOf(Looper.getMainLooper()).idleFor(ms, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -197,10 +221,18 @@ public class MediaSessionPluginTest {
     }
 
     private void setPlaybackState(String state) {
+        setPlaybackStateNoIdle(state);
+        idleMainLooper();
+    }
+
+    /**
+     * Drives {@code setPlaybackState} WITHOUT idling the main looper afterwards, so the test can
+     * control exactly how far the looper (and the debounced teardown timer) is advanced.
+     */
+    private void setPlaybackStateNoIdle(String state) {
         PluginCall call = mock(PluginCall.class);
         when(call.getString(eq("playbackState"), anyString())).thenReturn(state);
         plugin.setPlaybackState(call);
-        idleMainLooper();
     }
 
     @Test
@@ -332,7 +364,12 @@ public class MediaSessionPluginTest {
         assertNotNull(getPluginField("service"));
 
         setPlaybackState("none");
+        // The teardown is now debounced: the service is still bound immediately after 'none' (the
+        // settle window has not been advanced yet).
+        assertNotNull(getPluginField("service"));
 
+        // Advance past the settle window: the debounced teardown fires and the service is unbound.
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
         assertNull(getPluginField("service"));
     }
 
@@ -342,9 +379,149 @@ public class MediaSessionPluginTest {
         setPlaybackState("playing");
 
         setPlaybackState("none");
+        // 'always' mode never schedules a teardown; even after a long advance the service stays bound.
+        idleMainFor(1000);
 
         assertNotNull(getPluginField("service"));
         assertEquals(Player.STATE_IDLE, player.getPlaybackState());
+    }
+
+    // --- Service teardown debounce (R-2) ------------------------------------------------------
+
+    @Test
+    public void playingNoneThenPlayingWithinWindowKeepsServiceBound() throws Exception {
+        registerActionHandlers("play", "pause");
+
+        setPlaybackState("playing");
+        Object boundService = getPluginField("service");
+        assertNotNull(boundService);
+
+        // A brief 'none' between tracks schedules the debounced teardown but does not run it.
+        setPlaybackStateNoIdle("none");
+        idleMainFor(100);
+        assertNotNull("teardown should not have fired within the window", getPluginField("service"));
+
+        // 'playing' again within the window cancels the pending teardown and keeps the SAME binding.
+        setPlaybackStateNoIdle("playing");
+        idleMainFor(1000);
+
+        assertSame("service must not be rebound (same instance)", boundService, getPluginField("service"));
+        assertNull("no teardown should remain pending", getPluginField("pendingServiceTeardown"));
+        assertEquals(Player.STATE_READY, player.getPlaybackState());
+        assertTrue(player.getPlayWhenReady());
+    }
+
+    @Test
+    public void settledNoneTearsDownServiceAfterDelay() throws Exception {
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        setPlaybackState("none");
+        // Immediately after 'none' the service is still bound (debounced).
+        assertNotNull(getPluginField("service"));
+
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+        assertNull(getPluginField("service"));
+    }
+
+    @Test
+    public void repeatedNoneDoesNotResetTeardownWindow() throws Exception {
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        // First 'none' starts the clock.
+        setPlaybackState("none");
+        idleMainFor(400);
+        assertNotNull("still within the original window", getPluginField("service"));
+
+        // A second 'none' must NOT reset the timer; cumulative 800 > 750 from the FIRST 'none' tears
+        // the service down.
+        setPlaybackState("none");
+        idleMainFor(400);
+
+        assertNull("teardown timer must not be reset by repeated 'none'", getPluginField("service"));
+    }
+
+    @Test
+    public void singleBindSingleUnbindNoIllegalArgument() throws Exception {
+        // playing -> none(settled teardown) -> playing(rebind) -> none(settled teardown). No exception
+        // across the whole sequence; service bound mid-playback, unbound after each settled teardown.
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+        assertNull(getPluginField("service"));
+        assertFalse("binding released after teardown", (Boolean) getPluginField("serviceBindingRequested"));
+
+        // Rebind.
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+        assertTrue("rebind requests a fresh binding", (Boolean) getPluginField("serviceBindingRequested"));
+
+        // Settle down again — no IllegalArgumentException from a double unbind, binding released.
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+
+        assertNull(getPluginField("service"));
+        assertFalse((Boolean) getPluginField("serviceBindingRequested"));
+        // Corroborate via Robolectric's bound-connection bookkeeping: zero live connections remain
+        // after the final teardown (the unbind was honored, not double-applied).
+        assertEquals(0, ShadowApplication.getInstance().getBoundServiceConnections().size());
+    }
+
+    @Test
+    public void alwaysModeNeverSchedulesTeardown() throws Exception {
+        setPluginField("startServiceOnlyDuringPlayback", false);
+
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        setPlaybackState("none");
+        idleMainFor(2000);
+
+        assertNotNull("always mode keeps the service", getPluginField("service"));
+        assertNull("always mode never schedules a teardown", getPluginField("pendingServiceTeardown"));
+    }
+
+    @Test
+    public void handleOnDestroyCancelsPendingTeardownAndStopsImmediately() throws Exception {
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+
+        // Schedule a teardown but do NOT advance the window.
+        setPlaybackState("none");
+        assertNotNull(getPluginField("service"));
+        assertNotNull("teardown should be pending", getPluginField("pendingServiceTeardown"));
+
+        // Destroy: service is stopped immediately and the pending teardown is canceled.
+        plugin.handleOnDestroy();
+        assertNull(getPluginField("service"));
+        assertNull(getPluginField("pendingServiceTeardown"));
+
+        // Advancing afterwards must not double-stop / throw (the canceled runnable never runs).
+        idleMainFor(2000);
+        assertNull(getPluginField("service"));
+    }
+
+    @Test
+    public void playbackStateBindDecisionRunsOnMainLooper() throws Exception {
+        // setUp() wired the service directly; first settle it down so service starts null/unbound.
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+        assertNull(getPluginField("service"));
+
+        // resolve() happens synchronously on the bridge thread; the bind decision is deferred to the
+        // main looper, so the service is not bound until the looper is idled.
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString(eq("playbackState"), anyString())).thenReturn("playing");
+        plugin.setPlaybackState(call);
+
+        verify(call).resolve();
+        assertNull("bind decision must not have run yet", getPluginField("service"));
+
+        idleMainLooper();
+        assertNotNull("bind decision runs once the main looper is idled", getPluginField("service"));
     }
 
     @Test

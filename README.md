@@ -64,6 +64,23 @@ You can also read the last values you set back from the plugin's own cache (not 
 const { playbackState } = await MediaSession.getPlaybackState();
 ```
 
+### Configuration (Android)
+
+On Android the plugin reads an optional `foregroundService` key from the `MediaSession` plugin block of your Capacitor configuration. It controls when the underlying media service (and therefore the `MediaSession` and its notification) is started:
+
+* `'always'` — the service and `MediaSession` are started at plugin load and kept alive regardless of playback state. The session and its notification are present *before* the first `setPlaybackState('playing')`.
+* default (key absent or any other value) — *during-playback only*: the service starts on the first `'playing'`/`'paused'` state and is stopped shortly after playback settles to a non-playing state. A brief settle delay is applied before teardown so a momentary `'none'` between tracks (immediately followed by `'playing'`) does not churn the service binding.
+
+```json
+{
+  "plugins": {
+    "MediaSession": {
+      "foregroundService": "always"
+    }
+  }
+}
+```
+
 ## API
 
 <docgen-index>

@@ -539,3 +539,130 @@ README; plain backticked prose is used instead (consistent with the rest of the 
 - **R3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO).
 - **R-2** — service teardown debounce: rapid `playing`↔`none` transitions bind/unbind/stop the service
   repeatedly with no debounce; a short settle window would avoid churn.
+
+### Iteration 6 — binding-state main-looper confinement + teardown debounce + foregroundService docs
+
+**Shipped** (addresses deferred **R-1** binding-state confinement + **R-2** teardown debounce, plus
+a **U-1** docs gap). Android + README ONLY — no TS/`web.ts`/`index.ts`/example change, no public
+method signature change. The bind/teardown decision moved off the bridge thread onto the main looper
+and is now debounced; the `setPlaybackState` promise still resolves immediately (independent of the
+bind outcome).
+
+- **R-1 — `service`/`serviceBindingRequested` are now strictly MAIN-LOOPER-CONFINED.** Dropped the
+  reliance on these being touched from the bridge thread; both fields are now mutated/read only on the
+  main looper, so the check-then-bind in `applyPlaybackState` (`if (service == null) startMediaService()`)
+  is atomic w.r.t. `onServiceConnected`/`onServiceDisconnected` (which Android already delivers on
+  main) without `volatile`. Added confinement Javadoc on both fields (mirroring the `actionHandlers`
+  doc) and a "MUST be called on the main looper" line on `startMediaService`/`stopMediaService` (their
+  bodies are unchanged; they no longer post — callers are responsible for being on main).
+  - `setPlaybackState` (bridge thread) rewritten to the `setMetadata` pattern: write `playbackState`
+    on the bridge thread, capture `final boolean playback`, `mainHandler.post(() ->
+    applyPlaybackState(playback))`, then `call.resolve()` immediately on the bridge thread (resolve
+    does not depend on the bind outcome).
+  - New `applyPlaybackState(boolean)` (main looper): `if (destroyed) return;`; on `playback`
+    cancel any pending teardown, bind if `service == null`, then `pushPlayerState()` INLINE (replacing
+    the old `updateServiceState()` post — one deterministic main-looper turn; when the service is not
+    bound yet `pushPlayerState` early-returns and `onServiceConnected` pushes once connected, as
+    before); on non-playing in during-playback-only mode `scheduleServiceTeardown()` (was an immediate
+    stop); else (`always` mode) `pushPlayerState()`.
+  - `load()` now defers the `always`-mode startup by one looper turn (`mainHandler.post(this::startMediaService)`)
+    so EVERY mutation of `service`/`serviceBindingRequested` is literally main-looper.
+  - Audited every reader/writer ends up on main: `load` (posts), `applyPlaybackState` (posted),
+    `startMediaService`/`stopMediaService` (assume main), `onServiceConnected`/`onServiceDisconnected`
+    (already main), `pushPlayerState`/`updateCustomLayout` reads (already main), `handleOnDestroy`
+    (main). Media3 session/player stays main-only (unchanged).
+
+- **R-2 — debounced service teardown.** New main-confined `Runnable pendingServiceTeardown` field and
+  `static final long SERVICE_TEARDOWN_DELAY_MS = 750` (Javadoc: settle window absorbing between-tracks
+  `'none'`). `scheduleServiceTeardown()` (main): if a teardown is already pending it KEEPS the existing
+  timer (first `'none'` starts the clock; does NOT reset — prevents starvation); else posts a delayed
+  runnable that nulls the field then `stopMediaService()`. `cancelPendingServiceTeardown()` (main):
+  removes the callback and nulls the field; no-op when nothing is pending. A `'playing'`/`'paused'`
+  cancels a pending stop BEFORE the `service == null` check, so `none → playing` within the window
+  keeps the binding (no unbind/rebind). `'always'` mode never schedules teardown (the else-if is never
+  taken). `handleOnDestroy` reordered: `destroyed = true;` → `removeCallbacksAndMessages(null);` →
+  `cancelPendingServiceTeardown();` (defensive field clear) → `artworkExecutor.shutdownNow();` →
+  `stopMediaService();` (immediate, unconditional) → `super`. Teardown is never deferred on destroy.
+
+- **U-1 — documented `foregroundService`.** Hand-written "Configuration (Android)" subsection added to
+  `README.md` ABOVE `<docgen-index>` (after "Listening for actions and reading state back"), so it
+  survives docgen. Documents the Capacitor config key `foregroundService` under the `MediaSession`
+  plugin block: `'always'` = service/MediaSession started at plugin load and kept alive regardless of
+  playback (session/notification present before the first `setPlaybackState('playing')`); default
+  (absent/other) = during-playback only (starts on `'playing'`/`'paused'`, stops shortly after it
+  settles to a non-playing state — the brief settle delay is called out so R-2 is documented). Includes
+  the JSON snippet `{ "plugins": { "MediaSession": { "foregroundService": "always" } } }`. No
+  `definitions.ts`/docgen change (config keys are not plugin methods).
+
+**Files changed**
+
+- `android/.../MediaSessionPlugin.java` — R-1 field confinement Javadoc (`service`/`serviceBindingRequested`)
+  + "MUST be on main" docs on `startMediaService`/`stopMediaService`; deferred `always` startup in
+  `load()`; rewritten `setPlaybackState` + new `applyPlaybackState`; R-2 `pendingServiceTeardown` /
+  `SERVICE_TEARDOWN_DELAY_MS` + `scheduleServiceTeardown`/`cancelPendingServiceTeardown`; reordered
+  `handleOnDestroy`.
+- `android/.../MediaSessionPluginTest.java` — `idleMainFor(ms)` (ShadowLooper `idleFor`) + `setPlaybackStateNoIdle`
+  helpers; a `SERVICE_TEARDOWN_DELAY_MS()` reflection reader; setUp registers the real binder via
+  `ShadowApplication.setComponentNameAndServiceForBindService(...)` so a real rebind after teardown
+  drives `onServiceConnected` with the live binder; two migrated teardown tests + 7 new R-2 tests.
+- `README.md` — hand-written "Configuration (Android)" subsection (outside docgen blocks; build only
+  touched the 17 added lines, docgen blocks unchanged).
+
+**Test cases added/migrated** (Android +7 net; MediaSessionPluginTest 52 → 59)
+
+- Migrated `setPlaybackStateNoneStopsServiceDuringPlaybackOnlyMode`: asserts `service` still non-null
+  immediately after `'none'` (window not advanced), then `idleMainFor(SERVICE_TEARDOWN_DELAY_MS+50)`
+  and asserts `service == null`.
+- Migrated `setPlaybackStateNoneKeepsServiceInAlwaysMode`: adds `idleMainFor(1000)` after `'none'` and
+  asserts `service` still non-null (no teardown ever).
+- New: `playingNoneThenPlayingWithinWindowKeepsServiceBound` (none→playing within window keeps the SAME
+  instance, no rebind, `pendingServiceTeardown == null`, player READY/playWhenReady);
+  `settledNoneTearsDownServiceAfterDelay`; `repeatedNoneDoesNotResetTeardownWindow` (400+400 cumulative
+  from FIRST none → torn down); `singleBindSingleUnbindNoIllegalArgument` (playing→none→playing→none
+  with window advances; no `IllegalArgumentException`, final `service == null` /
+  `serviceBindingRequested == false` / `getBoundServiceConnections().size() == 0`);
+  `alwaysModeNeverSchedulesTeardown` (`pendingServiceTeardown == null` after a long advance);
+  `handleOnDestroyCancelsPendingTeardownAndStopsImmediately` (destroy with a pending teardown →
+  immediate `service == null`, `pendingServiceTeardown == null`, later advance no double-stop);
+  `playbackStateBindDecisionRunsOnMainLooper` (resolve() before idle, `service` stays null until the
+  posted `applyPlaybackState` runs — after a settled teardown to start from a null/unbound state).
+
+**Verification — both required gates green**
+
+- Web (root build): `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0); README
+  regenerated, the hand-written Configuration prose survived (only the 17 added lines changed). Example
+  vitest not run (no TS/example change).
+- Android: `cd android && ./gradlew clean test` → `BUILD SUCCESSFUL`; **117 tests, 0 failures / 0
+  errors** (ArtworkScalingTest 5, ArtworkSelectionTest 13, MediaSessionPluginTest 59,
+  MediaSessionServiceTest 12, WebViewProxyPlayerTest 28).
+
+**Deliberate compat delta**
+
+- In default (during-playback-only) mode, a non-playing state no longer stops the service IMMEDIATELY:
+  there is now a **~750 ms settle delay** (`SERVICE_TEARDOWN_DELAY_MS`) before teardown. This is the
+  intended R-2 behaviour (absorbs the between-tracks `'none'`), documented in the README. A
+  `none → playing` within that window keeps the existing binding (previously it unbound then rebound).
+  `'always'` mode and the steady-state single-push-per-call behaviour are unchanged. Teardown on
+  `handleOnDestroy` remains immediate (never deferred).
+
+**Deviation from plan** — minor test-scaffolding additions only. (1) Added
+`ShadowApplication.setComponentNameAndServiceForBindService(...)` in `setUp` because the existing
+scaffolding wired the initial connection manually (bypassing `bindService`); a real rebind after a
+debounced teardown needed Robolectric's `bindService` to deliver the live binder rather than its
+default null binder. (2) `singleBindSingleUnbindNoIllegalArgument` corroborates with
+`getBoundServiceConnections().size() == 0` only AFTER the final teardown (the initial
+manually-wired connection is not tracked by `bindService`, so a mid-playback "== 1" assertion is not
+meaningful with this scaffolding); the bind/unbind correctness is otherwise asserted via
+`service`/`serviceBindingRequested`. (3) `playbackStateBindDecisionRunsOnMainLooper` (the plan's
+optional test #7) first settles a teardown so `service` starts null (setUp leaves it non-null),
+making "service stays null until idle" observable.
+
+**Deferred (seeds for the next critic)**
+
+- **F-3 (carried)** — arbitrary bitmap icons for custom actions (`iconUri`/custom drawable threading;
+  still limited to the curated built-in `CommandButton.ICON_*` set).
+- **F-4 / R-3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO); no
+  artwork-failure signal surfaced to JS.
+- **U-2** — Android `getMetadata` omits artwork (only decoded bytes are cached natively; the original
+  artwork array / a data-URL round-trip is not returned), an asymmetry vs. the web getter that could be
+  documented or closed.

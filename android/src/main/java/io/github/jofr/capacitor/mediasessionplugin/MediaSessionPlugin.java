@@ -151,8 +151,40 @@ public class MediaSessionPlugin extends Plugin {
         }
     }
 
+    /**
+     * The bound {@link MediaSessionService}, or {@code null} when not bound. MAIN-LOOPER-CONFINED:
+     * every read and write happens on the main looper. Writers ({@link #startMediaService} /
+     * {@link #stopMediaService}, both of which must be called on main, and
+     * {@code onServiceConnected}/{@code onServiceDisconnected}, which Android already delivers on the
+     * main looper), and readers ({@link #pushPlayerState}, {@link #updateCustomLayout},
+     * {@link #applyPlaybackState}, {@link #handleOnDestroy}) all run there, so the check-then-bind in
+     * {@link #applyPlaybackState} is atomic with respect to the connection callbacks without
+     * {@code volatile} or further synchronization.
+     */
     private MediaSessionService service = null;
+
+    /**
+     * Whether a {@code bindService} request is currently outstanding (guards against a duplicate bind
+     * and tracks whether {@code unbindService} must be called). MAIN-LOOPER-CONFINED exactly like
+     * {@link #service}: mutated only on the main looper by {@link #startMediaService} /
+     * {@link #stopMediaService} / {@code onServiceDisconnected}, so no {@code volatile} is needed.
+     */
     private boolean serviceBindingRequested = false;
+
+    /**
+     * Pending debounced service-teardown runnable, or {@code null} when none is scheduled.
+     * MAIN-LOOPER-CONFINED: created/cleared only on the main looper by {@link #scheduleServiceTeardown}
+     * / {@link #cancelPendingServiceTeardown} / its own body, and posted via {@link #mainHandler}.
+     */
+    private Runnable pendingServiceTeardown = null;
+
+    /**
+     * Settle window (ms) before a non-playing state actually tears the service down. Absorbs the brief
+     * {@code 'none'} that occurs between tracks (and other transient non-playing blips) so the service
+     * binding is not churned (unbound/stopped then immediately rebound) when playback resumes within
+     * the window.
+     */
+    private static final long SERVICE_TEARDOWN_DELAY_MS = 750;
 
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
@@ -190,10 +222,16 @@ public class MediaSessionPlugin extends Plugin {
                 + "' startServiceOnlyDuringPlayback=" + startServiceOnlyDuringPlayback);
 
         if (!startServiceOnlyDuringPlayback) {
-            startMediaService();
+            // Defer one looper turn so that EVERY mutation of service/serviceBindingRequested happens
+            // on the main looper (load() may run on a different thread); startMediaService assumes main.
+            mainHandler.post(this::startMediaService);
         }
     }
 
+    /**
+     * Binds the {@link MediaSessionService}. MUST be called on the main looper (it reads/writes
+     * {@link #service} and {@link #serviceBindingRequested}, which are main-looper-confined).
+     */
     private void startMediaService() {
         if (serviceBindingRequested) {
             return;
@@ -204,6 +242,11 @@ public class MediaSessionPlugin extends Plugin {
         getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
     }
 
+    /**
+     * Unbinds and stops the {@link MediaSessionService}. MUST be called on the main looper (it
+     * reads/writes {@link #service} and {@link #serviceBindingRequested}, which are
+     * main-looper-confined).
+     */
     private void stopMediaService() {
         if (serviceBindingRequested) {
             try {
@@ -510,17 +553,79 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setPlaybackState(PluginCall call) {
+        // playbackState is written on the bridge thread (read back by getPlaybackState there too).
         playbackState = call.getString("playbackState", playbackState);
 
+        // Capture the bind decision input on the bridge thread, then hop to the main looper so the
+        // service/serviceBindingRequested mutation stays main-looper-confined. resolve() does not
+        // depend on the bind outcome, so it happens immediately on the bridge thread (the setMetadata
+        // pattern).
         final boolean playback = playbackState.equals("playing") || playbackState.equals("paused");
-        if (playback && service == null) {
-            startMediaService();
-        } else if (!playback && startServiceOnlyDuringPlayback) {
-            stopMediaService();
-        } else {
-            updateServiceState();
-        }
+        mainHandler.post(() -> applyPlaybackState(playback));
         call.resolve();
+    }
+
+    /**
+     * Applies the bind/teardown decision for a playback-state change on the MAIN looper (so the
+     * service/serviceBindingRequested mutation is main-looper-confined). A {@code playing}/{@code paused}
+     * state ensures the service is bound and cancels any pending teardown; a non-playing state in
+     * during-playback-only mode schedules a debounced teardown; in {@code always} mode it just pushes
+     * the (idle) state and keeps the service.
+     */
+    private void applyPlaybackState(boolean playback) {
+        if (destroyed) {
+            return;
+        }
+        if (playback) {
+            // A playing/paused state cancels any pending teardown BEFORE the service==null check, so a
+            // none->playing transition within the settle window keeps the existing binding (never
+            // tears it down / rebinds).
+            cancelPendingServiceTeardown();
+            if (service == null) {
+                startMediaService();
+            }
+            // Already on main, so push inline (one deterministic looper turn). When the service is not
+            // bound yet pushPlayerState early-returns (harmless/uniform); onServiceConnected pushes the
+            // state once the binding completes, as today.
+            pushPlayerState();
+        } else if (startServiceOnlyDuringPlayback) {
+            // During-playback-only mode: debounce the teardown so a brief between-tracks 'none' that is
+            // quickly followed by 'playing' does not churn the binding.
+            scheduleServiceTeardown();
+        } else {
+            // 'always' mode: keep the service, just push the (idle) state. Never schedules teardown.
+            pushPlayerState();
+        }
+    }
+
+    /**
+     * Schedules a debounced service teardown on the MAIN looper. The FIRST non-playing state starts
+     * the clock; a subsequent non-playing state while a teardown is already pending KEEPS the existing
+     * timer (does not reset it), so repeated {@code 'none'} events cannot starve the teardown
+     * indefinitely. Call on the main looper.
+     */
+    private void scheduleServiceTeardown() {
+        if (pendingServiceTeardown != null) {
+            // Keep the existing pending stop; do not reset the timer (prevents starvation).
+            return;
+        }
+        final Runnable runnable = () -> {
+            pendingServiceTeardown = null;
+            stopMediaService();
+        };
+        pendingServiceTeardown = runnable;
+        mainHandler.postDelayed(runnable, SERVICE_TEARDOWN_DELAY_MS);
+    }
+
+    /**
+     * Cancels a pending debounced service teardown, if any. No-op when nothing is pending. Call on the
+     * main looper.
+     */
+    private void cancelPendingServiceTeardown() {
+        if (pendingServiceTeardown != null) {
+            mainHandler.removeCallbacks(pendingServiceTeardown);
+            pendingServiceTeardown = null;
+        }
     }
 
     @PluginMethod
@@ -752,6 +857,9 @@ public class MediaSessionPlugin extends Plugin {
         // shutting down the artwork executor / stopping the service, so nothing re-posts afterwards.
         destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
+        // Defensive: removeCallbacksAndMessages(null) already dropped the posted teardown, but clear
+        // the field too so nothing references a stale runnable. Teardown is never deferred on destroy.
+        cancelPendingServiceTeardown();
         artworkExecutor.shutdownNow();
         stopMediaService();
         super.handleOnDestroy();
