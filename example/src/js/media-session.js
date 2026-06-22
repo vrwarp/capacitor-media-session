@@ -89,13 +89,21 @@ export function setupMediaSession(audioElement) {
     // `label` (and optional `icon`); on Android they render as an extra Media3 custom-layout button
     // in the media notification, and they are a silent no-op on Web/iOS. Re-registering the same
     // action from inside its own handler flips the label/icon, turning it into a toggle.
+    //
+    // `iconUri` (a content/resource/file URI the system UI resolves itself) and `enabled` are also
+    // Android-only and degrade to a no-op on Web/iOS. `iconUri` takes precedence over the built-in
+    // `icon`; `enabled` defaults to true.
     let liked = false;
     const registerLike = () => {
         MediaSession.setActionHandler(
             {
                 action: 'like',
                 label: liked ? 'Unlike' : 'Like',
-                icon: liked ? 'heart-filled' : 'heart'
+                icon: liked ? 'heart-filled' : 'heart',
+                iconUri: liked
+                    ? 'content://media-session-demo/unlike.png'
+                    : 'content://media-session-demo/like.png',
+                enabled: true
             },
             () => {
                 liked = !liked;

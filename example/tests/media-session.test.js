@@ -214,10 +214,15 @@ describe('setupMediaSession', () => {
         ([options]) => options.action === 'like',
       );
 
-    // First registration: "Like" / "heart".
+    // First registration: "Like" / "heart", with the Android-only iconUri + enabled options.
     const firstCalls = likeCalls();
     expect(firstCalls.length).toBe(1);
-    expect(firstCalls[0][0]).toMatchObject({ label: 'Like', icon: 'heart' });
+    expect(firstCalls[0][0]).toMatchObject({
+      label: 'Like',
+      icon: 'heart',
+      iconUri: 'content://media-session-demo/like.png',
+      enabled: true,
+    });
 
     // Invoking the handler flips the state and re-registers as "Unlike" / "heart-filled".
     getActionHandler('like')({ action: 'like' });
@@ -227,6 +232,8 @@ describe('setupMediaSession', () => {
     expect(secondCalls[1][0]).toMatchObject({
       label: 'Unlike',
       icon: 'heart-filled',
+      iconUri: 'content://media-session-demo/unlike.png',
+      enabled: true,
     });
   });
 });

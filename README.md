@@ -119,6 +119,9 @@ least ~512px, otherwise the largest available). Fetching is
 loaded, and the artwork appears shortly afterwards. Supplying an `artwork`
 array whose selected image fails to load **clears** any previously shown
 cover, whereas omitting the `artwork` property entirely **preserves** it.
+The selected artwork `src` may be an `http(s)://` URL (fetched, with large
+images downsampled) or a `data:` URI (base64 or percent-encoded); `blob:`
+URLs are not supported on Android.
 
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |

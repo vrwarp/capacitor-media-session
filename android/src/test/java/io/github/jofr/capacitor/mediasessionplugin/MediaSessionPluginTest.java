@@ -9,7 +9,6 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
-import static org.mockito.ArgumentMatchers.anyFloat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -541,7 +540,7 @@ public class MediaSessionPluginTest {
         PluginCall call = mock(PluginCall.class);
         when(call.getDouble(eq("duration"), anyDouble())).thenReturn(100.0);
         when(call.getDouble(eq("position"), anyDouble())).thenReturn(50.5);
-        when(call.getFloat(eq("playbackRate"), anyFloat())).thenReturn(1.5f);
+        when(call.getDouble(eq("playbackRate"), anyDouble())).thenReturn(1.5);
 
         plugin.setPositionState(call);
         idleMainLooper();
@@ -924,16 +923,16 @@ public class MediaSessionPluginTest {
         PluginCall full = mock(PluginCall.class);
         when(full.getDouble(eq("duration"), anyDouble())).thenReturn(120.0);
         when(full.getDouble(eq("position"), anyDouble())).thenReturn(10.0);
-        when(full.getFloat(eq("playbackRate"), anyFloat())).thenReturn(2.0f);
+        when(full.getDouble(eq("playbackRate"), anyDouble())).thenReturn(2.0);
         plugin.setPositionState(full);
         idleMainLooper();
 
-        // Second call omits duration/playbackRate: getDouble/getFloat return the default arg, which is
-        // now the previously stored value. Only position is updated.
+        // Second call omits duration/playbackRate: getDouble returns the default arg, which is now the
+        // previously stored value. Only position is updated.
         PluginCall partial = mock(PluginCall.class);
         when(partial.getDouble(eq("duration"), anyDouble())).thenAnswer(inv -> inv.getArgument(1));
         when(partial.getDouble(eq("position"), anyDouble())).thenReturn(55.0);
-        when(partial.getFloat(eq("playbackRate"), anyFloat())).thenAnswer(inv -> inv.getArgument(1));
+        when(partial.getDouble(eq("playbackRate"), anyDouble())).thenAnswer(inv -> inv.getArgument(1));
         plugin.setPositionState(partial);
         idleMainLooper();
 
@@ -1318,7 +1317,9 @@ public class MediaSessionPluginTest {
         PluginCall setCall = mock(PluginCall.class);
         when(setCall.getDouble(eq("duration"), anyDouble())).thenReturn(180.0);
         when(setCall.getDouble(eq("position"), anyDouble())).thenReturn(42.0);
-        when(setCall.getFloat(eq("playbackRate"), anyFloat())).thenReturn(1.5f);
+        // 1.05 is not exactly representable as a float, so a float round-trip would lose precision;
+        // the getDouble path must preserve it exactly (U-1 precision regression guard).
+        when(setCall.getDouble(eq("playbackRate"), anyDouble())).thenReturn(1.05);
         plugin.setPositionState(setCall);
         idleMainLooper();
 
@@ -1330,7 +1331,7 @@ public class MediaSessionPluginTest {
         JSObject result = captor.getValue();
         assertEquals(180.0, result.getDouble("duration"), 0.0001);
         assertEquals(42.0, result.getDouble("position"), 0.0001);
-        assertEquals(1.5, result.getDouble("playbackRate"), 0.0001);
+        assertEquals(1.05, result.getDouble("playbackRate"), 0.0);
     }
 
     @Test

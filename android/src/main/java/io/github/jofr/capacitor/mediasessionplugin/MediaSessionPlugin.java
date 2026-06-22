@@ -25,8 +25,10 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -53,6 +55,15 @@ public class MediaSessionPlugin extends Plugin {
 
     /** JPEG quality for the encoded artwork (cover art is opaque, so no alpha is lost). */
     private static final int ARTWORK_JPEG_QUALITY = 85;
+
+    /**
+     * Hard cap (bytes) on an ENCODED artwork image before it is decoded. Guards the single-thread
+     * artwork executor against an unbounded/malicious download (HTTP) or a huge embedded base64
+     * payload (data: URI) OOMing the process before {@code BitmapFactory} ever sees it. The decode
+     * itself is additionally downsampled (see {@link #computeInSampleSize(int, int, int)}), but this
+     * cap bounds the raw buffer that must be held in memory in the first place.
+     */
+    private static final int MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
 
     private boolean startServiceOnlyDuringPlayback = true;
 
@@ -345,6 +356,26 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     /**
+     * Pure (unit-tested) {@code BitmapFactory.Options.inSampleSize} computation: the power-of-two
+     * subsampling factor used to decode a {@code srcW}x{@code srcH} image down toward {@code maxEdge}
+     * without first allocating the full-resolution bitmap.
+     *
+     * <p>Half-dimension loop: starting from {@code 1}, the factor is doubled while BOTH half-edges
+     * ({@code srcH/2/s} and {@code srcW/2/s}) still stay at or above {@code maxEdge}. The result is the
+     * largest power of two such that the subsampled image is not smaller than {@code maxEdge} on either
+     * edge (the final exact downscale to {@code maxEdge} is done afterwards by {@code scaleBitmap}).
+     * Always returns a power of two {@code >= 1}; degenerate {@code srcW}/{@code srcH <= 0} returns
+     * {@code 1}.
+     */
+    static int computeInSampleSize(int srcW, int srcH, int maxEdge) {
+        int s = 1;
+        while (srcW > 0 && srcH > 0 && (srcH / 2 / s) >= maxEdge && (srcW / 2 / s) >= maxEdge) {
+            s *= 2;
+        }
+        return s;
+    }
+
+    /**
      * Sentinel max-edge for the {@code "any"} {@code sizes} token (e.g. vector artwork). The selector
      * substitutes {@link #MAX_ARTWORK_DIMENSION} for it so an {@code "any"} entry ties an ideal raster
      * of the target size rather than always winning as "largest".
@@ -465,33 +496,139 @@ public class MediaSessionPlugin extends Plugin {
         return stream.toByteArray();
     }
 
+    /**
+     * Decodes a {@code data:} URI (RFC 2397) into its RAW payload bytes (NOT a bitmap). Returns
+     * {@code null} for any input that is not a well-formed {@code data:} URI, or whose body fails to
+     * decode. Pure / package-private (unit-tested via {@code ArtworkDataUriTest}).
+     *
+     * <p>The {@code base64} flag is detected by TOKEN match: the metadata segment (between {@code data:}
+     * and the first comma) is split on {@code ;} and a segment must exactly {@code equals} {@code base64}
+     * — so e.g. {@code ;charset=base64x} is NOT treated as base64. A base64 body is decoded with
+     * {@code Base64.DEFAULT} (standard alphabet, per RFC 2397); a non-base64 body is percent-decoded as
+     * UTF-8. Any decode failure yields {@code null} (no exception escapes).
+     */
+    static byte[] decodeDataUri(String url) {
+        if (url == null || !url.startsWith("data:")) {
+            return null;
+        }
+        String remainder = url.substring("data:".length());
+        int comma = remainder.indexOf(',');
+        if (comma < 0) {
+            return null;
+        }
+        String meta = remainder.substring(0, comma);
+        String body = remainder.substring(comma + 1);
+
+        boolean base64 = false;
+        for (String segment : meta.toLowerCase().split(";")) {
+            if (segment.equals("base64")) {
+                base64 = true;
+                break;
+            }
+        }
+
+        if (base64) {
+            // A data: URI's ;base64 payload is standard base64 per RFC 2397/4648; a body the standard
+            // alphabet rejects is malformed and yields null (the cover is then cleared by the caller).
+            try {
+                return Base64.decode(body, Base64.DEFAULT);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "decodeDataUri: base64 body rejected", e);
+                return null;
+            }
+        }
+
+        try {
+            return URLDecoder.decode(body, "UTF-8").getBytes("UTF-8");
+        } catch (UnsupportedEncodingException | IllegalArgumentException e) {
+            Log.w(TAG, "decodeDataUri: could not percent-decode data: body", e);
+            return null;
+        }
+    }
+
+    /**
+     * Dispatches an artwork {@code src} URL by SCHEME and returns encoded cover-art bytes (or
+     * {@code null}). {@code data:} URIs are decoded in-process (base64 or percent-encoded);
+     * {@code http(s)://} is fetched over the network (hardened/size-capped, see
+     * {@link #httpToArtworkData(String)}); {@code blob:} remains unsupported; anything else is dropped.
+     */
     private byte[] urlToArtworkData(String url) throws IOException {
+        if (url == null) {
+            return null;
+        }
+        if (url.startsWith("data:")) {
+            byte[] bytes = decodeDataUri(url);
+            if (bytes == null) {
+                return null;
+            }
+            return bytesToArtworkData(bytes, bytes.length);
+        }
         if (url.startsWith("blob:")) {
             Log.i(TAG, "Converting Blob URLs to artwork is not yet supported");
             return null;
         }
-
-        if (url.startsWith("http")) {
-            HttpURLConnection connection = (HttpURLConnection) (new URL(url)).openConnection();
-            connection.setConnectTimeout(5000);
-            connection.setReadTimeout(5000);
-            connection.setDoInput(true);
-            connection.connect();
-            try (InputStream inputStream = connection.getInputStream()) {
-                return bitmapToArtworkData(BitmapFactory.decodeStream(inputStream));
-            } finally {
-                connection.disconnect();
-            }
+        if (url.startsWith("http://") || url.startsWith("https://")) {
+            return httpToArtworkData(url);
         }
-
-        int base64Index = url.indexOf(";base64,");
-        if (base64Index != -1) {
-            String base64Data = url.substring(base64Index + 8);
-            byte[] decoded = Base64.decode(base64Data, Base64.DEFAULT);
-            return bitmapToArtworkData(BitmapFactory.decodeByteArray(decoded, 0, decoded.length));
-        }
-
         return null;
+    }
+
+    /**
+     * Fetches an {@code http(s)://} artwork URL into encoded cover-art bytes. Hardened: rejects a
+     * non-200 response, and reads at most {@link #MAX_ARTWORK_BYTES} of the body (aborting to
+     * {@code null} if the stream exceeds the cap) before a single downsampled decode. The connection
+     * is always {@code disconnect()}ed. Runs on the artwork executor (off the bridge thread).
+     */
+    private byte[] httpToArtworkData(String url) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) (new URL(url)).openConnection();
+        connection.setConnectTimeout(5000);
+        connection.setReadTimeout(5000);
+        connection.setDoInput(true);
+        try {
+            connection.connect();
+            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "httpToArtworkData: non-200 response (" + connection.getResponseCode()
+                        + ") for " + url);
+                return null;
+            }
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            try (InputStream inputStream = connection.getInputStream()) {
+                byte[] chunk = new byte[16 * 1024];
+                int total = 0;
+                int read;
+                while ((read = inputStream.read(chunk)) != -1) {
+                    total += read;
+                    if (total > MAX_ARTWORK_BYTES) {
+                        Log.w(TAG, "httpToArtworkData: artwork exceeds " + MAX_ARTWORK_BYTES
+                                + " bytes — aborting fetch of " + url);
+                        return null;
+                    }
+                    buffer.write(chunk, 0, read);
+                }
+            }
+            byte[] bytes = buffer.toByteArray();
+            return bytesToArtworkData(bytes, bytes.length);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    /**
+     * Two-pass decode of ENCODED image bytes into scaled cover-art bytes, shared by the {@code data:}
+     * and {@code http(s)://} branches (a huge embedded base64 PNG is the same OOM risk as a huge
+     * download). Pass 1 reads only the bounds ({@code inJustDecodeBounds}) to pick a power-of-two
+     * {@code inSampleSize} (see {@link #computeInSampleSize(int, int, int)}); pass 2 decodes the
+     * subsampled bitmap, which {@code bitmapToArtworkData}/{@code scaleBitmap} then finishes scaling to
+     * exactly {@link #MAX_ARTWORK_DIMENSION}. Returns {@code null} if the bytes do not decode.
+     */
+    private byte[] bytesToArtworkData(byte[] buf, int len) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(buf, 0, len, options);
+        options.inSampleSize = computeInSampleSize(options.outWidth, options.outHeight, MAX_ARTWORK_DIMENSION);
+        options.inJustDecodeBounds = false;
+        Bitmap bitmap = BitmapFactory.decodeByteArray(buf, 0, len, options);
+        return bitmapToArtworkData(bitmap);
     }
 
     @PluginMethod
@@ -648,7 +785,7 @@ public class MediaSessionPlugin extends Plugin {
         // pass 0/0/1 explicitly to reset.
         duration = call.getDouble("duration", this.duration);
         position = call.getDouble("position", this.position);
-        playbackRate = call.getFloat("playbackRate", (float) this.playbackRate);
+        playbackRate = call.getDouble("playbackRate", this.playbackRate);
 
         updateServiceState();
         call.resolve();
