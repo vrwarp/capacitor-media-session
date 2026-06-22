@@ -30,6 +30,16 @@ The API of this plugin is modeled after the [already widely supported](https://d
 
 __There is one notable difference compared to the Web API__: You have to explicitly set the playback state to `"playing"` (using [`setPlaybackState()`](#setplaybackstate)) for the notification to start showing. You also have to explicitly set action handlers for play/pause (using [`setActionHandler()`](#setactionhandler)) for the controls in the notification to show up and work. For simple cases on the Web platform (e.g. playing audio using an `<audio>` element) the browser detects playback and wires simple actions like play/pause automatically up. Using this plugin you have to wire up the `<audio>` element manually because the plugin cannot detect audio playback in the WebView on Android automatically. There is an example app included in the repository [that shows how to do that](https://github.com/jofr/capacitor-media-session/blob/main/example/src/js/media-session.js).
 
+## Features
+
+* **Standard Media Session actions** — `play`, `pause`, `seekto`, `seekforward`, `seekbackward`, `previoustrack`, `nexttrack` and `stop`, plus **arbitrary custom actions** (Android) registered with any non-standard action string.
+* **Custom action options** (Android) — `label`, `icon` (built-in Media3 icons), `iconUri` (a custom drawable URI) and `enabled` per custom-action button.
+* **Read-back getters** — `getMetadata()`, `getPlaybackState()` and `getPositionState()` return the last values you set from the plugin's own cache.
+* **Listeners** — `addListener('action', …)` fires for every action (standard *and* custom, including the `data` payload), and `addListener('artworkload', …)` reports the artwork load outcome.
+* **Async, size-aware artwork** — `http(s)://` and `data:` URIs; a single best-fit image is selected by size, downsampled and capped at 8&nbsp;MB; `http <-> https` cross-protocol redirects are followed (bounded hop count).
+* **Service lifecycle config** — the Android `foregroundService` key chooses `'always'` (started at load) vs. during-playback only.
+* **Graceful Web/iOS degradation** — Web and iOS map onto `navigator.mediaSession`; custom actions are a silent no-op there.
+
 ### Custom actions (Android)
 
 Besides the standard Media Session actions you can register a *custom action* by passing any non-standard action string together with a `label` (and optional `icon`). A common pattern is a toggle that re-registers itself from inside its own handler to flip the label and icon:
@@ -344,7 +354,7 @@ explicitly to reset them.
 
 #### MediaImage
 
-A single artwork image for {@link <a href="#metadataoptions">MetadataOptions.artwork</a>}. Mirrors the
+A single artwork image for a <a href="#metadataoptions">`MetadataOptions.artwork`</a> entry. Mirrors the
 [`MediaImage`](https://w3c.github.io/mediasession/#dictdef-mediaimage)
 dictionary of the Media Session Web API. Declared locally (rather than
 relying on the ambient `lib.dom` type) so the generated documentation renders

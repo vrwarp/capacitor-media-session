@@ -65,6 +65,14 @@ public class MediaSessionPlugin extends Plugin {
      */
     private static final int MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
 
+    /**
+     * Maximum number of HTTP redirects {@link #httpToArtworkData(String)} will follow before giving
+     * up. Our fetch loop owns ALL redirects (we disable {@code HttpURLConnection}'s automatic
+     * following), so this cap also covers the cross-protocol {@code http <-> https} hops the JVM would
+     * otherwise refuse to follow silently.
+     */
+    private static final int MAX_ARTWORK_REDIRECTS = 5;
+
     private boolean startServiceOnlyDuringPlayback = true;
 
     private String title = "";
@@ -574,43 +582,123 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     /**
-     * Fetches an {@code http(s)://} artwork URL into encoded cover-art bytes. Hardened: rejects a
-     * non-200 response, and reads at most {@link #MAX_ARTWORK_BYTES} of the body (aborting to
-     * {@code null} if the stream exceeds the cap) before a single downsampled decode. The connection
-     * is always {@code disconnect()}ed. Runs on the artwork executor (off the bridge thread).
+     * Pure (unit-tested) redirect-decision helper: given an HTTP response {@code code}, the URL that
+     * produced it ({@code currentUrl}) and its {@code Location} header, returns the absolute URL the
+     * fetch loop should re-open next, or {@code null} to STOP (treat the response as terminal). Uses
+     * only {@link java.net.URL} (no {@code android.net.Uri}) so it is bare-JUnit testable.
+     *
+     * <p>Returns {@code null} (stop) unless ALL of the following hold, in which case the resolved
+     * absolute URL string is returned:
+     * <ol>
+     *   <li>{@code code} is one of 301, 302, 303, 307, 308;</li>
+     *   <li>{@code location} is non-null and non-blank;</li>
+     *   <li>{@code location} resolves against {@code currentUrl} as a valid (possibly relative) URL;</li>
+     *   <li>the resolved URL's protocol is exactly {@code http} or {@code https} (an SSRF/scheme guard
+     *       rejecting {@code ftp}/{@code file}/{@code data}/{@code jar}/etc.); cross-protocol
+     *       {@code http <-> https} IS allowed;</li>
+     *   <li>the resolved URL is not identical to {@code currentUrl} (self-loop guard).</li>
+     * </ol>
+     */
+    static String resolveRedirect(int code, String currentUrl, String location) {
+        if (code != 301 && code != 302 && code != 303 && code != 307 && code != 308) {
+            return null;
+        }
+        if (location == null || location.trim().isEmpty()) {
+            return null;
+        }
+        final URL resolved;
+        try {
+            resolved = new URL(new URL(currentUrl), location);
+        } catch (java.net.MalformedURLException e) {
+            return null;
+        }
+        final String protocol = resolved.getProtocol();
+        if (!"http".equals(protocol) && !"https".equals(protocol)) {
+            return null;
+        }
+        final String next = resolved.toString();
+        if (next.equals(currentUrl)) {
+            return null;
+        }
+        return next;
+    }
+
+    /**
+     * Fetches an {@code http(s)://} artwork URL into encoded cover-art bytes, following redirects in a
+     * BOUNDED re-open loop that OWNS all redirects. {@code HttpURLConnection}'s automatic following is
+     * disabled ({@code setInstanceFollowRedirects(false)}) so EVERY redirect — same-protocol and the
+     * cross-protocol {@code http <-> https} hops the JVM otherwise refuses — flows through the uniform,
+     * unit-tested {@link #resolveRedirect(int, String, String)} decision. Hardened: a non-200 terminal
+     * response yields {@code null}; the body is read at most {@link #MAX_ARTWORK_BYTES} (with a
+     * Content-Length fast-fail) before a single downsampled decode; each hop's connection is
+     * {@code disconnect()}ed exactly once; the loop is capped at {@link #MAX_ARTWORK_REDIRECTS} hops and
+     * a revisited URL aborts the loop. Runs on the artwork executor (off the bridge thread).
      */
     private byte[] httpToArtworkData(String url) throws IOException {
-        HttpURLConnection connection = (HttpURLConnection) (new URL(url)).openConnection();
-        connection.setConnectTimeout(5000);
-        connection.setReadTimeout(5000);
-        connection.setDoInput(true);
-        try {
-            connection.connect();
-            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
-                Log.w(TAG, "httpToArtworkData: non-200 response (" + connection.getResponseCode()
-                        + ") for " + url);
-                return null;
-            }
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-            try (InputStream inputStream = connection.getInputStream()) {
-                byte[] chunk = new byte[16 * 1024];
-                int total = 0;
-                int read;
-                while ((read = inputStream.read(chunk)) != -1) {
-                    total += read;
-                    if (total > MAX_ARTWORK_BYTES) {
-                        Log.w(TAG, "httpToArtworkData: artwork exceeds " + MAX_ARTWORK_BYTES
-                                + " bytes — aborting fetch of " + url);
+        String currentUrl = url;
+        Set<String> visited = new HashSet<>();
+        visited.add(url);
+        for (int hop = 0; hop <= MAX_ARTWORK_REDIRECTS; hop++) {
+            HttpURLConnection connection = (HttpURLConnection) (new URL(currentUrl)).openConnection();
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(5000);
+            connection.setDoInput(true);
+            // Our loop owns ALL redirects (same- and cross-protocol) so they are uniform and testable.
+            connection.setInstanceFollowRedirects(false);
+            try {
+                connection.connect();
+                final int code = connection.getResponseCode();
+
+                // R-2 fast-fail: refuse an over-cap image up front when the server advertises the size
+                // (getContentLength()==-1 when unknown is not > cap, so this is safe; the streaming cap
+                // below still backstops a lying/absent Content-Length).
+                if (connection.getContentLength() > MAX_ARTWORK_BYTES) {
+                    Log.w(TAG, "httpToArtworkData: Content-Length exceeds " + MAX_ARTWORK_BYTES
+                            + " bytes — aborting fetch of " + currentUrl);
+                    return null;
+                }
+
+                final String next = resolveRedirect(code, currentUrl, connection.getHeaderField("Location"));
+                if (next != null) {
+                    if (visited.contains(next)) {
+                        Log.w(TAG, "httpToArtworkData: redirect loop detected at " + next
+                                + " — aborting fetch of " + url);
                         return null;
                     }
-                    buffer.write(chunk, 0, read);
+                    visited.add(next);
+                    currentUrl = next;
+                    continue;
                 }
+
+                // Terminal response: keep the existing non-200 reject + capped streaming decode.
+                if (code != HttpURLConnection.HTTP_OK) {
+                    Log.w(TAG, "httpToArtworkData: non-200 response (" + code + ") for " + currentUrl);
+                    return null;
+                }
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                try (InputStream inputStream = connection.getInputStream()) {
+                    byte[] chunk = new byte[16 * 1024];
+                    int total = 0;
+                    int read;
+                    while ((read = inputStream.read(chunk)) != -1) {
+                        total += read;
+                        if (total > MAX_ARTWORK_BYTES) {
+                            Log.w(TAG, "httpToArtworkData: artwork exceeds " + MAX_ARTWORK_BYTES
+                                    + " bytes — aborting fetch of " + currentUrl);
+                            return null;
+                        }
+                        buffer.write(chunk, 0, read);
+                    }
+                }
+                byte[] bytes = buffer.toByteArray();
+                return bytesToArtworkData(bytes, bytes.length);
+            } finally {
+                connection.disconnect();
             }
-            byte[] bytes = buffer.toByteArray();
-            return bytesToArtworkData(bytes, bytes.length);
-        } finally {
-            connection.disconnect();
         }
+        Log.w(TAG, "httpToArtworkData: too many redirects (> " + MAX_ARTWORK_REDIRECTS
+                + ") — aborting fetch of " + url);
+        return null;
     }
 
     /**

@@ -1,7 +1,7 @@
 import type { PluginListenerHandle } from '@capacitor/core';
 
 /**
- * A single artwork image for {@link MetadataOptions.artwork}. Mirrors the
+ * A single artwork image for a `MetadataOptions.artwork` entry. Mirrors the
  * [`MediaImage`](https://w3c.github.io/mediasession/#dictdef-mediaimage)
  * dictionary of the Media Session Web API. Declared locally (rather than
  * relying on the ambient `lib.dom` type) so the generated documentation renders

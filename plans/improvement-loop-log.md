@@ -959,3 +959,153 @@ is `string | number | boolean` rather than `any`.
   `artworkload` emission (this iteration covered it via the example mock test + the Android tests +
   the tsc/docgen gate); an `example/` demo wiring `artworkload` into UI; any remaining JSDoc/README
   tightening.
+
+### Iteration 10 — cross-protocol artwork redirect + README {@link} fix + Features/version/CHANGELOG
+
+**Shipped** (addresses the deferred **R3 cross-protocol redirect** + a **R-2** Content-Length fast-fail,
+the README `{@link}` literal **U-1**, and a **U-2** docs/release-metadata polish). Android + docs only —
+no `web.ts`/`index.ts`/example change, no public method-signature change. FINAL iteration.
+
+- **R-1 + R-2 — `httpToArtworkData` now OWNS all artwork redirects in a bounded re-open loop.**
+  Previously the fetch gated on `HTTP_OK`, so a silent `http <-> https` 3xx (which the JVM's automatic
+  follower refuses to cross) returned `null` and the cover cleared. The fetch now disables
+  `HttpURLConnection`'s automatic following (`setInstanceFollowRedirects(false)`) and routes EVERY
+  redirect — same-protocol AND cross-protocol — through one uniform, unit-tested decision:
+  - New `private static final int MAX_ARTWORK_REDIRECTS = 5;` (next to `MAX_ARTWORK_BYTES`).
+  - New PURE package-private `static String resolveRedirect(int code, String currentUrl, String location)`
+    using ONLY `java.net.URL` (no `android.net.Uri`, so it is bare-JUnit testable next to
+    `computeInSampleSize` in `ArtworkScalingTest`). Returns the absolute next URL to open, or `null` to
+    stop, returning `null` UNLESS all hold: (1) `code` ∈ {301,302,303,307,308}; (2) `location`
+    non-null/non-blank; (3) `new URL(new URL(currentUrl), location)` resolves (else `null` via caught
+    `MalformedURLException`); (4) the resolved protocol is exactly `http` or `https` (SSRF/scheme guard
+    rejecting `ftp`/`file`/`data`/`jar`/etc.; cross-protocol `http <-> https` IS allowed); (5) the
+    resolved URL is not `.equals(currentUrl)` (self-loop guard).
+  - `httpToArtworkData` rewritten into `for (int hop = 0; hop <= MAX_ARTWORK_REDIRECTS; hop++)`:
+    open the connection on `currentUrl` (same 5 s connect/read timeouts, `setDoInput(true)`,
+    `setInstanceFollowRedirects(false)`), `connect()`, read `getResponseCode()`. **R-2 fast-fail:**
+    `if (getContentLength() > MAX_ARTWORK_BYTES) return null;` (`-1` unknown is not `> cap`, so the
+    streaming cap still backstops). `resolveRedirect(...)`: if non-null and already `visited` → log
+    redirect loop → `null`; else add to `visited`, set `currentUrl`, `continue`. Otherwise the response
+    is TERMINAL and the EXISTING checks run unchanged — non-200 → `null`; else stream the body with the
+    `MAX_ARTWORK_BYTES` cap loop and `return bytesToArtworkData(buf, len)`. `try/finally` `disconnect()`s
+    each hop EXACTLY once (the redirect+continue path also goes through the `finally`). After the loop
+    exhausts → log "too many redirects" → `null`. A `Set<String> visited` seeded with the original `url`
+    + the per-hop `visited.contains(next)` check guard against cycles independently of the hop cap.
+  - Preserved: per-hop `MAX_ARTWORK_BYTES` streaming cap, per-hop `disconnect()`, `HTTP_OK` terminal
+    check, runs on the artwork executor, returns `null` on failure (still flows up to
+    `artworkload { loaded:false }`). No new imports (`java.net.URL`, `HttpURLConnection`,
+    `java.util.Set`, `java.util.HashSet` already imported; `java.net.MalformedURLException` used
+    fully-qualified).
+
+- **U-1 — README `{@link}` literal fixed.** The `MediaImage` interface JSDoc opening sentence in
+  `src/definitions.ts` was `… for {@link MetadataOptions.artwork}. Mirrors the …` — this docgen version
+  renders `{@link}` LITERALLY (it appeared verbatim in the README as
+  `{@link <a href="#metadataoptions">MetadataOptions.artwork</a>}`). Changed to plain backticked prose:
+  `… for a `+"`MetadataOptions.artwork`"+` entry. Mirrors the …`. It was the only `@link` in the JSDoc;
+  after `npm run build`, `grep -n "@link" README.md` returns NOTHING.
+
+- **U-2 — Features overview + version bump + CHANGELOG.**
+  - `README.md`: added a hand-written `## Features` section (7 bullets) in the Usage region ABOVE
+    `## API`/`<docgen-index>` (between the Usage intro prose and `### Custom actions (Android)`), so
+    docgen preserves it. Summarizes standard + custom actions, custom-action options
+    (`label`/`icon`/`iconUri`/`enabled`), read-back getters, the `action`/`artworkload` listeners,
+    async size-aware artwork (`http(s)`/`data:`, single-image selection, downsampling + 8 MB cap,
+    cross-protocol `http <-> https` redirect), the `foregroundService` config, and Web/iOS degradation.
+  - `package.json`: `version` bumped `4.0.0` → `4.1.0` (additive minor; nothing breaking).
+  - `CHANGELOG.md` (NEW top-level file): a `## 4.1.0` "Added" section with the Features bullets plus a
+    one-line note crediting the adversarial critique → ideation → improvement loop.
+
+**Files changed**
+
+- `android/.../MediaSessionPlugin.java` — `MAX_ARTWORK_REDIRECTS`; pure `resolveRedirect(...)`;
+  rewritten `httpToArtworkData` bounded re-open loop (owns all redirects, Content-Length fast-fail,
+  visited-set loop guard, per-hop single disconnect, too-many-redirects backstop).
+- `android/.../ArtworkScalingTest.java` — `assertNull` import + 13 new `resolveRedirect` cases.
+- `src/definitions.ts` — `MediaImage` JSDoc `{@link}` → backticked prose.
+- `README.md` — hand-written `## Features` section (outside docgen blocks) + regenerated by docgen
+  (the `MediaImage` table sentence no longer shows a literal `{@link}`).
+- `package.json` — version 4.0.0 → 4.1.0.
+- `CHANGELOG.md` — NEW; `## 4.1.0` Added section.
+
+**Tests added** (Android +13; ArtworkScalingTest 11 → 24; total 143 → 156)
+
+- `ArtworkScalingTest` `resolveRedirect` cases: same-protocol 301 absolute; cross-protocol http→https
+  301; cross-protocol https→http 302; relative absolute-path Location (`/c/d.png` →
+  `https://cdn.com/c/d.png`); relative sibling Location (`e.png` → `https://cdn.com/a/e.png`); 307
+  absolute; 308 relative; 303; non-3xx → null (200/404/500); non-http(s) Location → null
+  (`ftp://`, `file:///etc/passwd`, `data:text/plain,hi`); null/""/blank Location → null; self-loop →
+  null (absolute `https://a.com/x`→`https://a.com/x` AND relative `x` resolving to itself); malformed
+  Location → null. The `httpToArtworkData` socket loop itself is NOT directly tested (no MockWebServer
+  dependency — out of scope; not added); `resolveRedirect` covers the per-hop decision logic. The
+  injected `setArtworkFetcher` test harness bypasses `httpToArtworkData`, so the existing artwork tests
+  are unaffected.
+
+**Verification — both required gates green**
+
+- Web (root build): `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0); reported
+  version `4.1.0`. VERIFIED `grep -n "@link" README.md` returns NOTHING; the hand-written `## Features`,
+  `### Custom actions (Android)`, `### Listening for actions and reading state back` and
+  `### Configuration (Android)` prose all survived; the `MediaImage` table sentence now reads
+  "A single artwork image for a `MetadataOptions.artwork` entry." (no literal `{@link}`). Example
+  vitest not run (no `src/web.ts`/`index.ts`/example change).
+- Android: `cd android && ./gradlew test` → `BUILD SUCCESSFUL`; **156 tests, 0 failures / 0 errors**
+  (ArtworkScalingTest 24, ArtworkSelectionTest 13, ArtworkDataUriTest 7, MediaSessionPluginTest 72,
+  MediaSessionServiceTest 12, WebViewProxyPlayerTest 28).
+
+**Deviation from plan**
+
+- Plan test case #11 specified the malformed Location `"ht!tp://bad"`. Under `java.net.URL`, an
+  invalid scheme char makes the spec be treated as a RELATIVE reference (it does NOT throw), so
+  `new URL(new URL("http://a.com/x"), "ht!tp://bad")` resolves to `http://a.com/ht!tp://bad` (http
+  scheme, ≠ current) — i.e. `resolveRedirect` would return non-null, not null. To genuinely exercise
+  the caught-`MalformedURLException` → null branch the test uses `"http://[bad"` (an invalid authority
+  field, which DOES throw). The intent ("malformed Location → null, no exception escapes") is preserved
+  exactly; only the literal triggering string differs. 13 `resolveRedirect` cases were added
+  (ArtworkScalingTest 11 → 24, total 156) vs. the plan's "~11 / ~22 / ~155" estimate — the relative
+  Location case was split into two test methods (absolute-path + sibling) and self-loop into one method
+  with two asserts.
+
+**Deferred (intentional out-of-scope, carried into the loop-complete footer)**
+
+- **blob: / SVG native decoders** — `blob:` URLs and `data:image/svg+xml` remain
+  documented-not-built on Android (both cleanly clear and emit `artworkload { loaded:false }`). Adding
+  a real `blob:`/SVG rasterizer is a larger native-decoder effort, out of scope for this loop.
+- **MockWebServer socket test for the redirect loop** — `httpToArtworkData`'s real socket loop is not
+  directly tested (the plan explicitly forbade adding a network test dependency); `resolveRedirect`
+  unit tests cover the per-hop decision, and the injected-fetcher harness covers the surrounding
+  `setMetadata` flow.
+
+## Loop complete (10/10)
+
+All 10 adversarial critique → ideation → improvement iterations are done; both required gates are green
+on the final commit (`npm run build` exit 0 with a clean README; `./gradlew test` → BUILD SUCCESSFUL,
+**156 tests, 0 failures / 0 errors**). Every seeded gap from the baseline (and everything the per-iteration
+critics surfaced) has been addressed:
+
+- **Custom / extra actions** (seed F1) — full round trip with `label`/`icon`/`iconUri`/`enabled`
+  (iters 2, 7), self-re-registering example demo (iter 4).
+- **State read-back + events** — `getMetadata`/`getPlaybackState`/`getPositionState` getters and the
+  `addListener('action', …)` (with `data` payload) + `addListener('artworkload', …)` channels (iters 5, 9).
+- **seekOffset delivery + handler-removal/leak fixes** (iter 1).
+- **Artwork reliability** — off-bridge-thread async fetch, size-aware single-image selection,
+  stale-clearing + generation discarding, downsampled decode + 8 MB cap, `data:` URI support, and
+  (this iter) bounded cross-protocol `http <-> https` redirect following with an SSRF/scheme guard and
+  a Content-Length fast-fail (iters 3, 8, 10).
+- **Threading discipline** — handler-map and service/binding-state main-looper confinement, debounced
+  service teardown, destroyed-guard (iters 4, 5, 6).
+- **Usability / docs** — `setPositionState` defaulting + `playbackRate` precision, `foregroundService`
+  documented, plugin-local types so the README no longer renders `any`, the `{@link}` literal fixed, a
+  hand-written `## Features` overview, a `CHANGELOG.md`, and the `4.1.0` version bump (iters 3, 6, 8, 9, 10).
+
+**Remaining deferrals are intentional out-of-scope items**, not regressions:
+
+- **blob: / SVG native decoders on Android** — `blob:` URLs and `data:image/svg+xml` are documented as
+  unsupported; both cleanly clear the cover and emit `artworkload { loaded:false }`. A real native
+  rasterizer is a separate, larger effort.
+- **A MockWebServer socket test for the redirect loop** — the real `httpToArtworkData` socket loop is
+  not exercised by a network test (no network test dependency was added, by design); the pure
+  `resolveRedirect` per-hop decision is unit-tested and the injected-fetcher harness covers the
+  surrounding `setMetadata` flow.
+
+The plugin keeps both TypeScript and Android surfaces in sync, stays backward-compatible with the
+Media Session Web API, and degrades gracefully on Web/iOS throughout.
