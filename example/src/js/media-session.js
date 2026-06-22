@@ -84,4 +84,52 @@ export function setupMediaSession(audioElement) {
         audioElement.pause();
         updatePlaybackState();
     });
+
+    // Custom action: a "like" toggle. Custom actions are a non-standard action string with a
+    // `label` (and optional `icon`); on Android they render as an extra Media3 custom-layout button
+    // in the media notification, and they are a silent no-op on Web/iOS. Re-registering the same
+    // action from inside its own handler flips the label/icon, turning it into a toggle.
+    //
+    // `iconUri` (a content/resource/file URI the system UI resolves itself) and `enabled` are also
+    // Android-only and degrade to a no-op on Web/iOS. `iconUri` takes precedence over the built-in
+    // `icon`; `enabled` defaults to true.
+    let liked = false;
+    const registerLike = () => {
+        MediaSession.setActionHandler(
+            {
+                action: 'like',
+                label: liked ? 'Unlike' : 'Like',
+                icon: liked ? 'heart-filled' : 'heart',
+                iconUri: liked
+                    ? 'content://media-session-demo/unlike.png'
+                    : 'content://media-session-demo/like.png',
+                enabled: true
+            },
+            () => {
+                liked = !liked;
+                registerLike();
+            }
+        );
+    };
+    registerLike();
+
+    // Event channel: addListener('action', ...) fires on EVERY media action (standard + custom),
+    // in addition to any setActionHandler handler. Unlike setActionHandler (kept alive on Android),
+    // this resolves with a PluginListenerHandle you can await/remove. The details include the
+    // custom-action `data` payload on Android.
+    MediaSession.addListener('action', (details) => {
+        console.log('media-session action:', details.action, details.data ?? {});
+    });
+
+    // Artwork-load outcome: addListener('artworkload', ...) fires after a setMetadata artwork
+    // outcome. On Android loaded:false means the selected image failed to fetch/decode (cover
+    // cleared) or the array had no usable src; loaded:true carries the src that succeeded. On Web it
+    // fires loaded:true with the first artwork src right after the metadata handoff.
+    MediaSession.addListener('artworkload', (e) => console.log('artwork', e.loaded, e.src));
+
+    // Read-back getter demo: getPlaybackState/getMetadata/getPositionState return the last values
+    // set (the plugin's own cache), useful for resyncing UI after a resume.
+    MediaSession.getPlaybackState().then((state) => {
+        console.log('current playback state:', state.playbackState);
+    });
 }

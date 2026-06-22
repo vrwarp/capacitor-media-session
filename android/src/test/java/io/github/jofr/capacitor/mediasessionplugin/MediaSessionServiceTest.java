@@ -6,17 +6,29 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.robolectric.Shadows.shadowOf;
 
 import android.app.Service;
 import android.content.Intent;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Looper;
+
+import androidx.media3.session.MediaSession;
+import androidx.media3.session.SessionCommand;
+import androidx.media3.session.SessionResult;
+
+import com.getcapacitor.JSObject;
+import com.google.common.util.concurrent.ListenableFuture;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.android.controller.ServiceController;
@@ -48,6 +60,15 @@ public class MediaSessionServiceTest {
         assertNotNull(service.getPlayer());
         assertNotNull(service.onGetSession(null));
         assertSame(service.getPlayer(), service.onGetSession(null).getPlayer());
+    }
+
+    @Test
+    public void freshServiceHasEmptyCustomLayoutAndSessionCallback() {
+        // No custom actions registered yet: the session's custom layout starts empty and a session
+        // callback is attached so custom-command taps can be routed back to the plugin.
+        assertNotNull(service.getMediaSession());
+        assertTrue(service.getMediaSession().getCustomLayout().isEmpty());
+        assertNotNull(service.getSessionCallback());
     }
 
     @Test
@@ -127,5 +148,62 @@ public class MediaSessionServiceTest {
             a.destroy();
             b.destroy();
         }
+    }
+
+    // --- Custom-action args marshalling (F-1) --------------------------------------------------
+
+    @Test
+    public void onCustomCommandMarshalsArgsToPlugin() throws Exception {
+        MediaSessionPlugin mockPlugin = mock(MediaSessionPlugin.class);
+        service.setPlugin(mockPlugin);
+
+        Bundle args = new Bundle();
+        args.putString("name", "value");
+        args.putBoolean("flag", true);
+        args.putInt("count", 7);
+
+        ListenableFuture<SessionResult> future = service.getSessionCallback().onCustomCommand(
+                service.getMediaSession(),
+                mock(MediaSession.ControllerInfo.class),
+                new SessionCommand("like", Bundle.EMPTY),
+                args);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(mockPlugin).actionCallback(eq("like"), captor.capture());
+        JSObject data = captor.getValue();
+        assertEquals("value", data.getString("name"));
+        assertTrue(data.getBoolean("flag"));
+        assertEquals(7, data.getInt("count"));
+
+        assertEquals(SessionResult.RESULT_SUCCESS, future.get().resultCode);
+    }
+
+    @Test
+    public void bundleToJSObjectCoversCommonTypes() throws Exception {
+        Bundle bundle = new Bundle();
+        bundle.putString("s", "str");
+        bundle.putBoolean("b", false);
+        bundle.putInt("i", 1);
+        bundle.putLong("l", 2L);
+        bundle.putDouble("d", 3.5);
+        bundle.putFloat("f", 4.5f);
+        bundle.putString("nullable", null); // null values are skipped
+
+        JSObject obj = MediaSessionService.bundleToJSObject(bundle);
+
+        assertEquals("str", obj.getString("s"));
+        assertFalse(obj.getBoolean("b"));
+        assertEquals(1, obj.getInt("i"));
+        assertEquals(2L, obj.getLong("l"));
+        assertEquals(3.5, obj.getDouble("d"), 0.0001);
+        assertEquals(4.5, obj.getDouble("f"), 0.0001);
+        assertFalse(obj.has("nullable"));
+    }
+
+    @Test
+    public void bundleToJSObjectHandlesNullBundle() {
+        JSObject obj = MediaSessionService.bundleToJSObject(null);
+        assertNotNull(obj);
+        assertEquals(0, obj.length());
     }
 }

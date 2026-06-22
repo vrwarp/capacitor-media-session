@@ -6,6 +6,10 @@ vi.mock('@jofr/capacitor-media-session', () => ({
     setPlaybackState: vi.fn().mockResolvedValue(undefined),
     setPositionState: vi.fn().mockResolvedValue(undefined),
     setActionHandler: vi.fn().mockResolvedValue(undefined),
+    addListener: vi.fn().mockResolvedValue({ remove: vi.fn() }),
+    getMetadata: vi.fn().mockResolvedValue({}),
+    getPlaybackState: vi.fn().mockResolvedValue({ playbackState: 'none' }),
+    getPositionState: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -191,5 +195,52 @@ describe('setupMediaSession', () => {
 
     expect(audio.pause).toHaveBeenCalled();
     expect(lastPlaybackState()).toBe('none');
+  });
+
+  it('registers an "action" event listener', () => {
+    expect(MediaSession.addListener).toHaveBeenCalledWith(
+      'action',
+      expect.any(Function),
+    );
+  });
+
+  it('registers an "artworkload" event listener', () => {
+    expect(MediaSession.addListener).toHaveBeenCalledWith(
+      'artworkload',
+      expect.any(Function),
+    );
+  });
+
+  it('reads back the current playback state on setup', () => {
+    expect(MediaSession.getPlaybackState).toHaveBeenCalled();
+  });
+
+  it('toggles the "like" custom action label and icon', () => {
+    const likeCalls = () =>
+      MediaSession.setActionHandler.mock.calls.filter(
+        ([options]) => options.action === 'like',
+      );
+
+    // First registration: "Like" / "heart", with the Android-only iconUri + enabled options.
+    const firstCalls = likeCalls();
+    expect(firstCalls.length).toBe(1);
+    expect(firstCalls[0][0]).toMatchObject({
+      label: 'Like',
+      icon: 'heart',
+      iconUri: 'content://media-session-demo/like.png',
+      enabled: true,
+    });
+
+    // Invoking the handler flips the state and re-registers as "Unlike" / "heart-filled".
+    getActionHandler('like')({ action: 'like' });
+
+    const secondCalls = likeCalls();
+    expect(secondCalls.length).toBe(2);
+    expect(secondCalls[1][0]).toMatchObject({
+      label: 'Unlike',
+      icon: 'heart-filled',
+      iconUri: 'content://media-session-demo/unlike.png',
+      enabled: true,
+    });
   });
 });

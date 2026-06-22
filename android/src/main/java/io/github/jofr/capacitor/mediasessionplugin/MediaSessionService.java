@@ -1,16 +1,35 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Binder;
+import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.media3.common.Player;
+import androidx.media3.session.CommandButton;
 import androidx.media3.session.MediaSession;
+import androidx.media3.session.SessionCommand;
+import androidx.media3.session.SessionCommands;
+import androidx.media3.session.SessionResult;
 
+import com.getcapacitor.JSObject;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import io.github.jofr.capacitor.mediasessionplugin.CustomActions.CustomActionSpec;
 
 /**
  * Foreground service hosting the Media3 {@link MediaSession}. Media3 takes care of the media
@@ -34,6 +53,23 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     private MediaSession mediaSession;
     @Nullable
     private WebViewProxyPlayer player;
+
+    /** Back-reference to the plugin so custom-command taps can be routed to its JS handlers. */
+    @Nullable
+    private MediaSessionPlugin plugin;
+
+    /**
+     * Current ordered custom-action buttons published in the session's custom layout. Kept so a
+     * newly connecting controller (via {@link CustomActionsCallback#onConnect}) can be granted the
+     * matching session commands and layout. Only mutated on the main looper.
+     */
+    private ImmutableList<CommandButton> customButtons = ImmutableList.of();
+
+    /** Session mutation must happen on the app/main looper, mirroring the proxy-player discipline. */
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** The session callback, retained so tests can drive onConnect/onCustomCommand directly. */
+    private final CustomActionsCallback sessionCallback = new CustomActionsCallback();
 
     private final IBinder localBinder = new LocalBinder();
 
@@ -70,6 +106,7 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
         try {
             mediaSession = new MediaSession.Builder(this, player)
                     .setId(sessionId)
+                    .setCallback(sessionCallback)
                     .build();
             // Register the session explicitly: it is usually only registered lazily through
             // onGetSession() when a Media3 controller connects, but the plugin connects through the
@@ -163,5 +200,195 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     @Nullable
     public WebViewProxyPlayer getPlayer() {
         return player;
+    }
+
+    @Nullable
+    MediaSession getMediaSession() {
+        return mediaSession;
+    }
+
+    /** Test accessor for the session callback so onConnect/onCustomCommand can be driven directly. */
+    MediaSession.Callback getSessionCallback() {
+        return sessionCallback;
+    }
+
+    /** Registers the plugin so custom-command taps can be routed back to its JS handlers. */
+    public void setPlugin(@Nullable MediaSessionPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    /**
+     * Marshals a custom-command {@link Bundle} into a {@link JSObject} so the per-tap arguments reach
+     * JS as {@code ActionDetails.data}. Each key is copied via the matching {@code JSObject.put}
+     * overload (String, boolean, int/long, double/float); null values are skipped and any other type
+     * falls back to {@code String.valueOf(...)}. A null/empty bundle yields an empty object.
+     */
+    static JSObject bundleToJSObject(@Nullable Bundle args) {
+        JSObject obj = new JSObject();
+        if (args == null) {
+            return obj;
+        }
+        for (String key : args.keySet()) {
+            Object value = args.get(key);
+            if (value == null) {
+                continue;
+            }
+            if (value instanceof String) {
+                obj.put(key, (String) value);
+            } else if (value instanceof Boolean) {
+                obj.put(key, (Boolean) value);
+            } else if (value instanceof Integer) {
+                obj.put(key, (Integer) value);
+            } else if (value instanceof Long) {
+                obj.put(key, (Long) value);
+            } else if (value instanceof Double) {
+                obj.put(key, (Double) value);
+            } else if (value instanceof Float) {
+                obj.put(key, (Float) value);
+            } else {
+                obj.put(key, String.valueOf(value));
+            }
+        }
+        return obj;
+    }
+
+    /**
+     * Fallback icon resource for a custom-action button that supplies an {@code iconUri} but no
+     * built-in icon constant. Media3's legacy {@code PlaybackStateCompat.CustomAction} path requires
+     * a non-zero {@code iconResId}; a button with only an {@code iconUri} would otherwise have
+     * {@code iconResId == 0} and throw when commands are granted to a legacy controller. A neutral
+     * system drawable keeps the legacy path valid while the {@code iconUri} drives the appearance on
+     * modern controllers.
+     */
+    private static final int FALLBACK_CUSTOM_ICON_RES_ID = android.R.drawable.ic_menu_more;
+
+    /**
+     * Builds a Media3 {@link CommandButton} for one custom action. The icon is passed as a built-in
+     * {@link CommandButton} {@code ICON_*} constant (Media3 resolves the bundled drawable); an
+     * {@code ICON_UNDEFINED} spec yields a button without a built-in icon. When the spec carries a
+     * non-empty {@code iconUri}, a custom drawable URI is layered on top via {@code setIconUri}
+     * (taking precedence over the icon constant, which is retained as a fallback). If no icon constant
+     * was supplied alongside the {@code iconUri}, a neutral fallback {@code iconResId} is set so the
+     * legacy {@code PlaybackStateCompat} path stays valid (see {@link #FALLBACK_CUSTOM_ICON_RES_ID}).
+     * The button's enabled state mirrors {@code spec.enabled}.
+     */
+    private static CommandButton buildButton(CustomActionSpec spec) {
+        CommandButton.Builder builder = (spec.iconConstant != CommandButton.ICON_UNDEFINED)
+                ? new CommandButton.Builder(spec.iconConstant)
+                : new CommandButton.Builder();
+        if (spec.iconUri != null && !spec.iconUri.isEmpty()) {
+            builder.setIconUri(Uri.parse(spec.iconUri));
+            if (spec.iconConstant == CommandButton.ICON_UNDEFINED) {
+                // No built-in icon constant to derive a legacy iconResId from; supply a neutral one so
+                // an iconUri-only button does not crash the legacy custom-action build.
+                builder.setCustomIconResId(FALLBACK_CUSTOM_ICON_RES_ID);
+            }
+        }
+        return builder
+                .setSessionCommand(new SessionCommand(spec.id, Bundle.EMPTY))
+                .setDisplayName(spec.label != null ? spec.label : "")
+                .setEnabled(spec.enabled)
+                .build();
+    }
+
+    /**
+     * Builds a {@link SessionCommands} containing the default session commands plus one custom
+     * {@link SessionCommand} per registered custom action. Used both for newly connecting
+     * controllers ({@link CustomActionsCallback#onConnect}) and for re-granting commands to
+     * already-connected controllers when actions change mid-session.
+     */
+    private static SessionCommands sessionCommandsFor(Collection<CommandButton> buttons) {
+        SessionCommands.Builder builder = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon();
+        for (CommandButton button : buttons) {
+            if (button.sessionCommand != null) {
+                builder.add(button.sessionCommand);
+            }
+        }
+        return builder.build();
+    }
+
+    /**
+     * Rebuilds the custom layout from the current ordered custom-action specs and publishes it to
+     * the session, re-granting the matching session commands to every already-connected controller
+     * so mid-session additions take effect immediately. Posts to the main looper; all session
+     * mutation happens there.
+     */
+    public void updateCustomActions(List<CustomActionSpec> specs) {
+        final List<CustomActionSpec> snapshot = new ArrayList<>(specs);
+        mainHandler.post(() -> {
+            MediaSession session = this.mediaSession;
+            if (session == null) {
+                Log.w(TAG, "updateCustomActions: no media session — dropping " + snapshot.size() + " custom action(s)");
+                return;
+            }
+
+            List<CommandButton> buttons = new ArrayList<>(snapshot.size());
+            for (CustomActionSpec spec : snapshot) {
+                buttons.add(buildButton(spec));
+            }
+            customButtons = ImmutableList.copyOf(buttons);
+
+            session.setCustomLayout(customButtons);
+
+            // Already-connected controllers were granted their command set at connect time, so
+            // re-grant it now to include any newly registered custom commands.
+            SessionCommands sessionCommands = sessionCommandsFor(customButtons);
+            for (MediaSession.ControllerInfo controller : session.getConnectedControllers()) {
+                session.setAvailableCommands(controller, sessionCommands,
+                        MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS);
+            }
+            Log.d(TAG, "updateCustomActions: published " + customButtons.size() + " custom button(s)");
+        });
+    }
+
+    /**
+     * {@link MediaSession.Callback} that grants the custom session commands on connect and routes
+     * custom-command taps back to the plugin's JS handlers.
+     */
+    private final class CustomActionsCallback implements MediaSession.Callback {
+        @Override
+        @NonNull
+        public MediaSession.ConnectionResult onConnect(
+                @NonNull MediaSession session,
+                @NonNull MediaSession.ControllerInfo controller) {
+            // Seed from the defaults so standard transport controls are not dropped, then add a
+            // session command per currently-registered custom action and publish the layout.
+            SessionCommands sessionCommands = sessionCommandsFor(customButtons);
+            return new MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                    .setAvailableSessionCommands(sessionCommands)
+                    .setCustomLayout(customButtons)
+                    .build();
+        }
+
+        @Override
+        @NonNull
+        public ListenableFuture<SessionResult> onCustomCommand(
+                @NonNull MediaSession session,
+                @NonNull MediaSession.ControllerInfo controller,
+                @NonNull SessionCommand sessionCommand,
+                @NonNull Bundle args) {
+            MediaSessionPlugin plugin = MediaSessionService.this.plugin;
+            if (plugin != null && sessionCommand.customAction != null && !sessionCommand.customAction.isEmpty()) {
+                // Marshal the controller-supplied args bundle (and any extras baked into the
+                // command) into the per-tap data payload that surfaces as ActionDetails.data in JS.
+                JSObject data = bundleToJSObject(args);
+                Bundle extras = sessionCommand.customExtras;
+                if (extras != null && !extras.isEmpty()) {
+                    JSObject extrasData = bundleToJSObject(extras);
+                    for (java.util.Iterator<String> it = extrasData.keys(); it.hasNext(); ) {
+                        String key = it.next();
+                        // The controller args bundle takes precedence over the command's seed extras.
+                        if (!data.has(key)) {
+                            data.put(key, extrasData.opt(key));
+                        }
+                    }
+                }
+                plugin.actionCallback(sessionCommand.customAction, data);
+            } else {
+                Log.w(TAG, "onCustomCommand: no plugin or empty customAction — dropping '"
+                        + sessionCommand.customAction + "'");
+            }
+            return Futures.immediateFuture(new SessionResult(SessionResult.RESULT_SUCCESS));
+        }
     }
 }
