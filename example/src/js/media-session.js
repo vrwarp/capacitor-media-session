@@ -121,6 +121,12 @@ export function setupMediaSession(audioElement) {
         console.log('media-session action:', details.action, details.data ?? {});
     });
 
+    // Artwork-load outcome: addListener('artworkload', ...) fires after a setMetadata artwork
+    // outcome. On Android loaded:false means the selected image failed to fetch/decode (cover
+    // cleared) or the array had no usable src; loaded:true carries the src that succeeded. On Web it
+    // fires loaded:true with the first artwork src right after the metadata handoff.
+    MediaSession.addListener('artworkload', (e) => console.log('artwork', e.loaded, e.src));
+
     // Read-back getter demo: getPlaybackState/getMetadata/getPositionState return the last values
     // set (the plugin's own cache), useful for resyncing UI after a resume.
     MediaSession.getPlaybackState().then((state) => {

@@ -1,6 +1,6 @@
 import { WebPlugin } from '@capacitor/core';
 
-import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, ActionHandler, ActionDetails, PositionStateOptions, MediaSessionPlugin } from './definitions';
+import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, ActionHandler, ActionDetails, PositionStateOptions, MediaSessionPlugin, MediaSessionPlaybackState, MediaSessionAction } from './definitions';
 
 /**
  * The eight actions defined by the Media Session Web API. Any other action
@@ -33,6 +33,16 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         this.metadataCache = { ...this.metadataCache, ...options };
         if ('mediaSession' in navigator) {
             navigator.mediaSession.metadata = new MediaMetadata(options);
+            // Mirror the Android 'artworkload' outcome event: on Web the metadata
+            // (incl. artwork) is handed off to navigator.mediaSession synchronously,
+            // so report loaded:true with the first artwork src. Only fire when the
+            // caller actually supplied an artwork array (omitting it preserves the
+            // previous cover and emits nothing, matching Android).
+            if ('artwork' in options) {
+                const src =
+                    options.artwork && options.artwork.length > 0 ? options.artwork[0].src : undefined;
+                this.notifyListeners('artworkload', { loaded: true, src });
+            }
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }

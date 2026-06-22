@@ -204,6 +204,13 @@ describe('setupMediaSession', () => {
     );
   });
 
+  it('registers an "artworkload" event listener', () => {
+    expect(MediaSession.addListener).toHaveBeenCalledWith(
+      'artworkload',
+      expect.any(Function),
+    );
+  });
+
   it('reads back the current playback state on setup', () => {
     expect(MediaSession.getPlaybackState).toHaveBeenCalled();
   });

@@ -1451,4 +1451,153 @@ public class MediaSessionPluginTest {
         verify(playCall, times(1)).resolve(any(JSObject.class));
         verify(listenerCall, atLeastOnce()).resolve(any(JSObject.class));
     }
+
+    // --- artworkload event (R1) ---------------------------------------------------------------
+
+    @Test
+    public void artworkLoadEventFiresLoadedTrueOnSuccess() throws JSONException {
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        plugin.setArtworkFetcher(src -> FIXED_ARTWORK_BYTES);
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/cover.png");
+        plugin.setMetadata(call);
+        drainArtwork();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        JSObject event = captor.getValue();
+        assertTrue("loaded should be true on a successful fetch", event.getBoolean("loaded"));
+        assertEquals("http://example.com/cover.png", event.getString("src"));
+    }
+
+    @Test
+    public void artworkLoadEventFiresLoadedFalseOnFetchFailure() throws JSONException {
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        plugin.setArtworkFetcher(src -> {
+            throw new IOException("boom");
+        });
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/missing.png");
+        plugin.setMetadata(call);
+        drainArtwork();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        JSObject event = captor.getValue();
+        assertFalse("loaded should be false when the fetch fails", event.getBoolean("loaded"));
+        assertEquals("http://example.com/missing.png", event.getString("src"));
+    }
+
+    @Test
+    public void artworkLoadEventFiresLoadedFalseWhenNoUsableSrc() throws JSONException {
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        AtomicBoolean fetched = new AtomicBoolean(false);
+        plugin.setArtworkFetcher(src -> {
+            fetched.set(true);
+            return FIXED_ARTWORK_BYTES;
+        });
+        // Empty artwork array: present key but no usable src -> clear, no fetch, loaded:false with no src.
+        PluginCall empty = mockMetadataTextCall();
+        when(empty.getArray("artwork")).thenReturn(new JSArray());
+        plugin.setMetadata(empty);
+        drainArtwork();
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        JSObject event = captor.getValue();
+        assertFalse("loaded should be false when no usable src", event.getBoolean("loaded"));
+        assertFalse("src must be omitted when there was nothing to attempt", event.has("src"));
+        assertFalse("the fetcher must never run for an empty array", fetched.get());
+    }
+
+    @Test
+    public void artworkLoadEventNotEmittedWhenArtworkKeyAbsent() throws JSONException {
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        // Text-only setMetadata (getArray("artwork") -> null): the artwork key is absent, so the
+        // previous cover is preserved and NO artworkload event is emitted.
+        PluginCall textOnly = mockMetadataTextCall();
+        when(textOnly.getArray("artwork")).thenReturn(null);
+        plugin.setMetadata(textOnly);
+        drainArtwork();
+
+        verify(listenerCall, never()).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void artworkLoadEventNotEmittedForStaleGeneration() throws Exception {
+        // Mirror staleArtworkResultIsDiscardedByGeneration: request A is gated, request B is newer.
+        // Exactly one artworkload must fire, carrying B's src; none may carry A's.
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        CountDownLatch gateA = new CountDownLatch(1);
+        byte[] bytesA = new byte[] { 9, 9, 9 };
+        byte[] bytesB = new byte[] { 7, 7, 7 };
+        plugin.setArtworkFetcher(src -> {
+            if (src.contains("A")) {
+                try {
+                    gateA.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return bytesA;
+            }
+            return bytesB;
+        });
+
+        PluginCall callA = mockMetadataCallWithArtwork("http://example.com/A.png");
+        plugin.setMetadata(callA);
+        idleMainLooper(); // select A -> submit (blocked) fetch, generation = 1
+
+        PluginCall callB = mockMetadataCallWithArtwork("http://example.com/B.png");
+        plugin.setMetadata(callB);
+        idleMainLooper(); // select B -> generation = 2, submit B's fetch (queued)
+
+        gateA.countDown();
+        assertTrue(plugin.awaitArtworkIdle(5000));
+        idleMainLooper(); // run both result-delivery posts; A's is discarded (stale generation)
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(listenerCall, atLeastOnce()).resolve(captor.capture());
+        // Exactly one artworkload event fired, and it carries B's src (A's stale result emitted nothing).
+        assertEquals("exactly one artworkload event should fire", 1, captor.getAllValues().size());
+        JSObject event = captor.getValue();
+        assertTrue(event.getBoolean("loaded"));
+        assertEquals("http://example.com/B.png", event.getString("src"));
+    }
+
+    @Test
+    public void artworkLoadEventNotEmittedAfterDestroy() throws Exception {
+        // Mirror destroyedGuardDropsLateArtwork: a latch-blocked fetcher keeps the result in flight
+        // while the plugin is destroyed; the late result-delivery must emit NO artworkload event.
+        PluginCall listenerCall = mockListenerCall("artworkload");
+        plugin.addListener(listenerCall);
+
+        CountDownLatch fetchGate = new CountDownLatch(1);
+        plugin.setArtworkFetcher(src -> {
+            try {
+                fetchGate.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FIXED_ARTWORK_BYTES;
+        });
+
+        PluginCall call = mockMetadataCallWithArtwork("http://example.com/cover.png");
+        plugin.setMetadata(call);
+        idleMainLooper(); // select -> submit the (blocked) fetch
+
+        plugin.handleOnDestroy();
+
+        fetchGate.countDown();
+        idleMainLooper(); // any late result-delivery runnable must be dropped by the destroyed guard
+
+        verify(listenerCall, never()).resolve(any(JSObject.class));
+    }
 }

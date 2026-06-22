@@ -837,3 +837,125 @@ no existing method-signature change on the public TS surface.
 - **U-2** — `ActionDetails.data` is typed `{ [key: string]: any }`; could be tightened.
 - **SVG/vector data URIs** — `data:image/svg+xml` decodes to bytes but `BitmapFactory` cannot
   rasterize them (still clears).
+
+### Iteration 9 — artworkload event + plugin-local types (fix README any) + data typing/getMetadata JSDoc
+
+**Shipped** (addresses deferred R-3 artwork-failure-to-JS signal, U-2 `data` typing, plus a docgen
+`any`→typed quality fix). ADDITIVE + backward-compatible; no existing method signature changed.
+
+- **R1 — `artworkload` event.** New `ArtworkLoadEvent { loaded: boolean; src?: string }` (JSDoc each
+  field) + an `addListener(eventName: 'artworkload', listenerFunc: (event: ArtworkLoadEvent) => void)`
+  overload (after the existing `addListener('action', …)`). Surfaces the artwork load OUTCOME of
+  `setMetadata` to JS — closing the long-deferred R-3 ("no artwork-failure signal surfaced to JS").
+  - **Android (`MediaSessionPlugin.java`):** new `private void notifyArtworkLoad(boolean loaded,
+    String src)` builds a `JSObject` (always `put("loaded", …)`; `put("src", …)` only when non-null)
+    and `notifyListeners("artworkload", event)`. Emitted at EXACTLY two points inside the
+    `setMetadata` main-looper artwork flow, and NOWHERE else: (1) the no-usable-src clear branch
+    (`src == null` → `artworkData = null; pushPlayerState();` → `notifyArtworkLoad(false, null)`);
+    (2) the fetch-delivery runnable, AFTER the `destroyed` early-return AND AFTER the
+    `generation != artworkGeneration` early-return (so a stale or post-destroy fetch emits NOTHING),
+    AFTER `artworkData = result; pushPlayerState();` → `notifyArtworkLoad(result != null, src)` (the
+    captured `final String src` covers both success and null/failure). The absent-artwork-key path
+    (returns before the post) emits nothing.
+  - **Web (`web.ts`):** inside the `'mediaSession' in navigator` success branch of `setMetadata`,
+    AFTER `navigator.mediaSession.metadata = new MediaMetadata(options)`, ONLY when the caller
+    supplied artwork (`'artwork' in options`): emit `notifyListeners('artworkload', { loaded: true,
+    src })` where `src` is `options.artwork[0].src` (or `undefined` for an empty array). Omitting the
+    `artwork` key fires nothing (mirrors Android).
+
+- **U1 — plugin-local types (kill README `any`).** Added `MediaImage { src; sizes?; type? }` (JSDoc
+  each field), `MediaSessionAction` (the 8-literal union), and `MediaSessionPlaybackState`
+  (`'none' | 'paused' | 'playing'`) to `definitions.ts` (after the `PluginListenerHandle` import,
+  before `MetadataOptions`). These were already referenced by `MetadataOptions.artwork`
+  (`MediaImage[]`), `PlaybackStateOptions.playbackState`, `ActionHandlerOptions.action`/
+  `ActionDetails.action` (`MediaSessionAction | string`) but previously resolved to the ambient
+  `lib.dom` globals, so docgen rendered them as `any`/`any[]`. They now resolve to the local types,
+  so the generated README renders `MediaImage[]` (with a `MediaImage` table), `MediaSessionPlaybackState`
+  and the `MediaSessionAction` union table instead of `any`. No signature changes. `web.ts` now imports
+  `MediaSessionPlaybackState` + `MediaSessionAction` from `./definitions` (the `playbackStateCache`
+  field type and the `setActionHandler(... as MediaSessionAction ...)` cast switch from the DOM globals
+  to the identical local unions; the local 8-literal `MediaSessionAction` is a subset of the DOM union,
+  so the cast stays assignable). No cast needed for `new MediaMetadata(options)` — local `MediaImage`
+  is structurally identical to the DOM `MediaImage`, so tsc accepts it clean.
+
+- **U2 — `data` typing + `getMetadata` JSDoc.** Tightened `ActionDetails.data` from
+  `{ [key: string]: any }` to `{ [key: string]: string | number | boolean }` (the only types the
+  `MediaSessionService.bundleToJSObject` marshaller emits) — closes deferred U-2. Appended to the
+  `getMetadata` JSDoc that it returns what you SET, not necessarily what is DISPLAYED: the returned
+  artwork array is the raw array supplied to `setMetadata`; on Android if the selected image later
+  fails to fetch/decode the displayed cover is cleared though `getMetadata` still returns the supplied
+  array, directing callers to the `artworkload` event for the actual load outcome.
+
+- **Example (`example/src/js/media-session.js`):** added one
+  `MediaSession.addListener('artworkload', (e) => console.log('artwork', e.loaded, e.src))` next to
+  the existing `addListener('action', …)`.
+
+**Files changed**
+
+- `src/definitions.ts` — `MediaImage`/`MediaSessionAction`/`MediaSessionPlaybackState` local types;
+  `ArtworkLoadEvent` interface + `addListener('artworkload')` overload (full JSDoc); `ActionDetails.data`
+  tightened; `getMetadata` JSDoc appended.
+- `src/web.ts` — import the local `MediaSessionPlaybackState`/`MediaSessionAction`; `setMetadata` emits
+  `artworkload` (loaded:true + first src) when artwork supplied.
+- `android/.../MediaSessionPlugin.java` — `notifyArtworkLoad(boolean, String)`; emits at the
+  no-usable-src clear branch and the fetch-delivery runnable (after both early-returns).
+- `example/src/js/media-session.js` — `addListener('artworkload', …)` demo.
+- `android/.../MediaSessionPluginTest.java` — 6 new artworkload tests (reuse the listener-mock +
+  injected-fetcher harness).
+- `example/tests/media-session.test.js` — assert `addListener('artworkload', fn)` is registered.
+- `README.md` — regenerated by docgen (new `ArtworkLoadEvent` + `addListener('artworkload')`,
+  `MediaImage`/`MediaImage[]`, `MediaSessionPlaybackState`, `MediaSessionAction` union, tightened
+  `data` type — all formerly `any`; hand-written prose subsections intact).
+
+**Test cases added** (Android +6 → MediaSessionPluginTest 66 → 72; example +1 → 18)
+
+- `artworkLoadEventFiresLoadedTrueOnSuccess` (fixed-bytes fetcher; http src → `loaded==true`, src==URL).
+- `artworkLoadEventFiresLoadedFalseOnFetchFailure` (fetcher throws `IOException` → `loaded==false`,
+  src==attempted URL).
+- `artworkLoadEventFiresLoadedFalseWhenNoUsableSrc` (empty `JSArray` → `loaded==false`, `has("src")==false`,
+  fetcher never runs).
+- `artworkLoadEventNotEmittedWhenArtworkKeyAbsent` (text-only `setMetadata`, `getArray("artwork")→null`
+  → `verify(listenerCall, never()).resolve(any())`).
+- `artworkLoadEventNotEmittedForStaleGeneration` (mirrors `staleArtworkResultIsDiscardedByGeneration`:
+  A gated, B newer; captor `getAllValues()` size == 1, carries B's src, none A's).
+- `artworkLoadEventNotEmittedAfterDestroy` (addListener BEFORE `handleOnDestroy`; latch-blocked fetcher;
+  destroy; release + idle → listener never resolved).
+- Example: `registers an "artworkload" event listener` (mirrors the action-listener registration test;
+  the existing `vi.mock` `addListener` already accepts any eventName, so no mock change needed).
+
+**Verification — all three gates green**
+
+- Web (root build): `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0). README
+  regenerated and VERIFIED: no `any`/`any[]` remains in the docgen API region — `MediaImage[]` (with a
+  `MediaImage` table), `MediaSessionPlaybackState`, the `MediaSessionAction` union table, the new
+  `ArtworkLoadEvent` table + `addListener('artworkload', ...)` section, and the tightened
+  `data: { [key: string]: string | number | boolean; }` all render. The `ActionDetails.action` type
+  still collapses to `string` (the `MediaSessionAction | string` union absorbs the literals — unchanged,
+  no longer `any`); the JSDoc prose documents the standard values. Hand-written prose subsections
+  (Custom actions / Listening / Configuration) intact.
+- Android: `cd android && ./gradlew test` → `BUILD SUCCESSFUL`; **143 tests, 0 failures / 0 errors**
+  (ArtworkScalingTest 11, ArtworkSelectionTest 13, ArtworkDataUriTest 7, MediaSessionPluginTest 72,
+  MediaSessionServiceTest 12, WebViewProxyPlayerTest 28).
+- Example: `cd example && npm test` (vitest) → **18 tests passed** (1 file).
+
+**README quality note** — this iteration's U1 closes the long-standing docgen gap where
+`MediaImage[]`, `MediaSessionAction`, and `MediaSessionPlaybackState` rendered as `any`/`any[]` in the
+README (they resolved to ambient `lib.dom` globals docgen cannot see). With plugin-local declarations
+the public API documentation now shows concrete shapes/unions for every property, and `ActionDetails.data`
+is `string | number | boolean` rather than `any`.
+
+**Deviation from plan** — none. (No `options as MediaMetadataInit` cast was required: tsc accepts
+`new MediaMetadata(options)` because the local `MediaImage` is structurally identical to the DOM
+`MediaImage`. The `MediaSessionAction` cast in `setActionHandler` stays as-is and remains assignable.)
+
+**Deferred (seeds for iteration 10 — final polish)**
+
+- **R3 — cross-protocol redirect** — `httpToArtworkData` still gates on `HTTP_OK`, so a silent
+  http↔https 3xx redirect returns `null`; this now SURFACES to JS as `artworkload { loaded: false }`,
+  but the fetch itself could follow `Location` once across protocols with a hop cap.
+- **blob: / SVG artwork** — `blob:` URLs and `data:image/svg+xml` remain documented-not-built on
+  Android (both cleanly clear + now emit `artworkload { loaded: false }`).
+- **Final-polish items** — e.g. a web unit harness to assert the real `MediaSessionWeb.setMetadata`
+  `artworkload` emission (this iteration covered it via the example mock test + the Android tests +
+  the tsc/docgen gate); an `example/` demo wiring `artworkload` into UI; any remaining JSDoc/README
+  tightening.

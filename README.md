@@ -92,6 +92,7 @@ On Android the plugin reads an optional `foregroundService` key from the `MediaS
 * [`getPlaybackState()`](#getplaybackstate)
 * [`getPositionState()`](#getpositionstate)
 * [`addListener('action', ...)`](#addlisteneraction)
+* [`addListener('artworkload', ...)`](#addlistenerartworkload)
 * [`setPositionState(...)`](#setpositionstate)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
@@ -204,6 +205,12 @@ the cache (the array as supplied to `setMetadata`, not a re-encoding of the
 decoded image bytes); the `artwork` key is omitted only when no artwork has
 ever been set.
 
+This returns what you **set**, not necessarily what is **displayed**: the
+returned `artwork` array is the raw array supplied to `setMetadata`. On
+Android, if the selected image later fails to fetch/decode the displayed
+cover is cleared, yet `getMetadata` still returns the supplied array. For
+the actual artwork load outcome, listen to the `artworkload` event.
+
 **Returns:** <code>Promise&lt;<a href="#metadataoptions">MetadataOptions</a>&gt;</code>
 
 --------------------
@@ -268,6 +275,38 @@ payload.
 --------------------
 
 
+### addListener('artworkload', ...)
+
+```typescript
+addListener(eventName: 'artworkload', listenerFunc: (event: ArtworkLoadEvent) => void) => Promise<PluginListenerHandle>
+```
+
+Adds a listener that fires after a `setMetadata` artwork **outcome**,
+reporting whether the cover artwork actually loaded.
+
+On Android it fires once the artwork update settles:
+`loaded: false` means the selected image failed to fetch/decode (the
+displayed cover is cleared) OR the supplied `artwork` array had no usable
+`src`; `loaded: true` carries the `src` that succeeded. It does **not**
+fire when the `artwork` key is omitted from `setMetadata` (which preserves
+the previous cover). On Web it fires `loaded: true` (with the first
+artwork `src`) right after the metadata is handed off to
+`navigator.mediaSession`, and likewise only when an `artwork` array was
+supplied.
+
+Use this to learn the real load outcome — `getMetadata` returns what you
+**set**, not necessarily what is **displayed**.
+
+| Param              | Type                                                                              |
+| ------------------ | --------------------------------------------------------------------------------- |
+| **`eventName`**    | <code>'artworkload'</code>                                                        |
+| **`listenerFunc`** | <code>(event: <a href="#artworkloadevent">ArtworkLoadEvent</a>) =&gt; void</code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
 ### setPositionState(...)
 
 ```typescript
@@ -295,26 +334,41 @@ explicitly to reset them.
 
 #### MetadataOptions
 
-| Prop          | Type                |
-| ------------- | ------------------- |
-| **`album`**   | <code>string</code> |
-| **`artist`**  | <code>string</code> |
-| **`artwork`** | <code>any[]</code>  |
-| **`title`**   | <code>string</code> |
+| Prop          | Type                      |
+| ------------- | ------------------------- |
+| **`album`**   | <code>string</code>       |
+| **`artist`**  | <code>string</code>       |
+| **`artwork`** | <code>MediaImage[]</code> |
+| **`title`**   | <code>string</code>       |
+
+
+#### MediaImage
+
+A single artwork image for {@link <a href="#metadataoptions">MetadataOptions.artwork</a>}. Mirrors the
+[`MediaImage`](https://w3c.github.io/mediasession/#dictdef-mediaimage)
+dictionary of the Media Session Web API. Declared locally (rather than
+relying on the ambient `lib.dom` type) so the generated documentation renders
+the concrete shape instead of `any`.
+
+| Prop        | Type                | Description                                                                                                                                                                                  |
+| ----------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`src`**   | <code>string</code> | URL of the image. May be an `http(s)://` URL or a `data:` URI (Android also supports `data:`; `blob:` is unsupported on Android).                                                            |
+| **`sizes`** | <code>string</code> | Space-separated list of `WxH` sizes the image is available in (e.g. `"96x96 512x512"`), or `"any"` for scalable artwork. Used on Android to pick the most appropriate single image to fetch. |
+| **`type`**  | <code>string</code> | MIME type of the image (e.g. `"image/png"`).                                                                                                                                                 |
 
 
 #### PlaybackStateOptions
 
-| Prop                | Type                                   |
-| ------------------- | -------------------------------------- |
-| **`playbackState`** | <code>MediaSessionPlaybackState</code> |
+| Prop                | Type                                                                            |
+| ------------------- | ------------------------------------------------------------------------------- |
+| **`playbackState`** | <code><a href="#mediasessionplaybackstate">MediaSessionPlaybackState</a></code> |
 
 
 #### ActionHandlerOptions
 
 | Prop          | Type                                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                  |
 | ------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`action`**  | <code>any</code>                                                          | The action to handle. In addition to the standard [MediaSessionAction](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler) values, any arbitrary string may be passed to register a *custom action*. Custom actions are only surfaced on Android (as an extra button in the media notification / session custom layout); on Web and iOS they are a silent no-op. |
+| **`action`**  | <code>string</code>                                                       | The action to handle. In addition to the standard [MediaSessionAction](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler) values, any arbitrary string may be passed to register a *custom action*. Custom actions are only surfaced on Android (as an extra button in the media notification / session custom layout); on Web and iOS they are a silent no-op. |
 | **`label`**   | <code>string</code>                                                       | Display label for a *custom action*. Android only. A custom action button is only rendered when a `label` is provided; standard actions ignore this field.                                                                                                                                                                                                                                   |
 | **`icon`**    | <code><a href="#mediasessionactionicon">MediaSessionActionIcon</a></code> | Icon for a *custom action* button. Android only. Maps to one of Media3's built-in `CommandButton` icons; an unknown or missing value falls back to an undefined icon. Standard actions ignore this field.                                                                                                                                                                                    |
 | **`iconUri`** | <code>string</code>                                                       | URI of a custom drawable for a *custom action* button (e.g. a `content://`, `android.resource://` or `file://` URI). Android only; a no-op on Web and iOS. When provided, `iconUri` takes precedence over `icon` for the button's appearance — the `icon` constant is still kept as a fallback. Standard actions ignore this field.                                                          |
@@ -323,12 +377,12 @@ explicitly to reset them.
 
 #### ActionDetails
 
-| Prop             | Type                                 | Description                                                                                                                                                                                                                                                                                                                                         |
-| ---------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`action`**     | <code>any</code>                     |                                                                                                                                                                                                                                                                                                                                                     |
-| **`seekOffset`** | <code>number \| null</code>          |                                                                                                                                                                                                                                                                                                                                                     |
-| **`seekTime`**   | <code>number \| null</code>          |                                                                                                                                                                                                                                                                                                                                                     |
-| **`data`**       | <code>{ [key: string]: any; }</code> | Extra per-tap data for the action. On Android this carries the *custom action* arguments/extras: the `Bundle` passed by the controller for a custom command (and any `customExtras` configured on the command) is marshalled into this object (string/boolean/number values). Standard actions do not populate this field; on Web/iOS it is unused. |
+| Prop             | Type                                                         | Description                                                                                                                                                                                                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`action`**     | <code>string</code>                                          |                                                                                                                                                                                                                                                                                                                                                     |
+| **`seekOffset`** | <code>number \| null</code>                                  |                                                                                                                                                                                                                                                                                                                                                     |
+| **`seekTime`**   | <code>number \| null</code>                                  |                                                                                                                                                                                                                                                                                                                                                     |
+| **`data`**       | <code>{ [key: string]: string \| number \| boolean; }</code> | Extra per-tap data for the action. On Android this carries the *custom action* arguments/extras: the `Bundle` passed by the controller for a custom command (and any `customExtras` configured on the command) is marshalled into this object (string/boolean/number values). Standard actions do not populate this field; on Web/iOS it is unused. |
 
 
 #### PositionStateOptions
@@ -347,7 +401,39 @@ explicitly to reset them.
 | **`remove`** | <code>() =&gt; Promise&lt;void&gt;</code> |
 
 
+#### ArtworkLoadEvent
+
+Payload of the `artworkload` event, reporting the OUTCOME of an artwork
+update from `setMetadata` (see `addListener('artworkload', ...)`).
+
+| Prop         | Type                 | Description                                                                                                                                                                                                                                                       |
+| ------------ | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`loaded`** | <code>boolean</code> | Whether the cover artwork was successfully loaded. `false` means the selected image failed to fetch/decode (the displayed cover is cleared) or the supplied `artwork` array had no usable `src`. `true` means an image was loaded and is now the displayed cover. |
+| **`src`**    | <code>string</code>  | The artwork `src` the outcome refers to. When `loaded` is `true` this is the `src` that succeeded; when `false` it is the `src` that was attempted (omitted entirely when the array had no usable `src` to attempt).                                              |
+
+
 ### Type Aliases
+
+
+#### MediaSessionPlaybackState
+
+The media playback state, mirroring the
+[Media Session Web API](https://w3c.github.io/mediasession/#enumdef-mediasessionplaybackstate).
+Declared locally so the generated documentation renders the concrete union
+instead of `any`.
+
+<code>'none' | 'paused' | 'playing'</code>
+
+
+#### MediaSessionAction
+
+The eight standard actions defined by the
+[Media Session Web API](https://w3c.github.io/mediasession/#enumdef-mediasessionaction).
+Declared locally so the generated documentation renders the concrete union
+instead of `any`. A `setActionHandler` / <a href="#actiondetails">`ActionDetails.action`</a> may also carry
+an arbitrary string (a *custom action*, Android only).
+
+<code>'play' | 'pause' | 'seekto' | 'seekforward' | 'seekbackward' | 'nexttrack' | 'previoustrack' | 'stop'</code>
 
 
 #### MediaSessionActionIcon

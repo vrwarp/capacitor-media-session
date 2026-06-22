@@ -670,6 +670,8 @@ public class MediaSessionPlugin extends Plugin {
                 // Array present but nothing usable: clear any previous cover (stale-clearing rule).
                 artworkData = null;
                 pushPlayerState();
+                // No usable src to attempt: report the load outcome with no src.
+                notifyArtworkLoad(false, null);
                 return;
             }
             artworkExecutor.submit(() -> {
@@ -684,22 +686,44 @@ public class MediaSessionPlugin extends Plugin {
                 mainHandler.post(() -> {
                     if (destroyed) {
                         // Plugin torn down while the fetch was in flight; drop the late result so it
-                        // never touches a released player/state (R-3 destroyed guard).
+                        // never touches a released player/state (R-3 destroyed guard). Emit nothing.
                         return;
                     }
                     if (generation != artworkGeneration) {
-                        // A newer artwork request superseded this one; discard the stale result.
+                        // A newer artwork request superseded this one; discard the stale result and
+                        // emit nothing (the newer request emits its own outcome).
                         return;
                     }
                     // Assign unconditionally: a failed/empty fetch CLEARS the previous cover so the
                     // displayed artwork always reflects the most recently supplied array.
                     artworkData = result;
                     pushPlayerState();
+                    // Report the load outcome for this (current, non-destroyed) request: loaded when
+                    // the fetch produced bytes, false when it failed/returned null (cover cleared).
+                    notifyArtworkLoad(result != null, src);
                 });
             });
         });
 
         call.resolve();
+    }
+
+    /**
+     * Emits the {@code artworkload} event reporting the OUTCOME of a {@link #setMetadata} artwork
+     * update (see the TS {@code addListener('artworkload', ...)} overload). {@code loaded} is
+     * {@code true} when an image was loaded as the displayed cover, {@code false} when the selected
+     * image failed to fetch/decode (cover cleared) or the supplied array had no usable {@code src}.
+     * The {@code src} is included only when non-null (the no-usable-src case omits it). Runs on the
+     * main looper (its only callers are the {@code setMetadata} artwork runnables, which are already
+     * on main); event delivery via {@link #notifyListeners} is itself thread-safe.
+     */
+    private void notifyArtworkLoad(boolean loaded, String src) {
+        JSObject event = new JSObject();
+        event.put("loaded", loaded);
+        if (src != null) {
+            event.put("src", src);
+        }
+        notifyListeners("artworkload", event);
     }
 
     @PluginMethod
