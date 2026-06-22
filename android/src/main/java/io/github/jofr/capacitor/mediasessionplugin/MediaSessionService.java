@@ -1,6 +1,7 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -252,18 +253,41 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     }
 
     /**
+     * Fallback icon resource for a custom-action button that supplies an {@code iconUri} but no
+     * built-in icon constant. Media3's legacy {@code PlaybackStateCompat.CustomAction} path requires
+     * a non-zero {@code iconResId}; a button with only an {@code iconUri} would otherwise have
+     * {@code iconResId == 0} and throw when commands are granted to a legacy controller. A neutral
+     * system drawable keeps the legacy path valid while the {@code iconUri} drives the appearance on
+     * modern controllers.
+     */
+    private static final int FALLBACK_CUSTOM_ICON_RES_ID = android.R.drawable.ic_menu_more;
+
+    /**
      * Builds a Media3 {@link CommandButton} for one custom action. The icon is passed as a built-in
      * {@link CommandButton} {@code ICON_*} constant (Media3 resolves the bundled drawable); an
-     * {@code ICON_UNDEFINED} spec yields a button without a built-in icon.
+     * {@code ICON_UNDEFINED} spec yields a button without a built-in icon. When the spec carries a
+     * non-empty {@code iconUri}, a custom drawable URI is layered on top via {@code setIconUri}
+     * (taking precedence over the icon constant, which is retained as a fallback). If no icon constant
+     * was supplied alongside the {@code iconUri}, a neutral fallback {@code iconResId} is set so the
+     * legacy {@code PlaybackStateCompat} path stays valid (see {@link #FALLBACK_CUSTOM_ICON_RES_ID}).
+     * The button's enabled state mirrors {@code spec.enabled}.
      */
     private static CommandButton buildButton(CustomActionSpec spec) {
         CommandButton.Builder builder = (spec.iconConstant != CommandButton.ICON_UNDEFINED)
                 ? new CommandButton.Builder(spec.iconConstant)
                 : new CommandButton.Builder();
+        if (spec.iconUri != null && !spec.iconUri.isEmpty()) {
+            builder.setIconUri(Uri.parse(spec.iconUri));
+            if (spec.iconConstant == CommandButton.ICON_UNDEFINED) {
+                // No built-in icon constant to derive a legacy iconResId from; supply a neutral one so
+                // an iconUri-only button does not crash the legacy custom-action build.
+                builder.setCustomIconResId(FALLBACK_CUSTOM_ICON_RES_ID);
+            }
+        }
         return builder
                 .setSessionCommand(new SessionCommand(spec.id, Bundle.EMPTY))
                 .setDisplayName(spec.label != null ? spec.label : "")
-                .setEnabled(true)
+                .setEnabled(spec.enabled)
                 .build();
     }
 

@@ -60,6 +60,14 @@ public class MediaSessionPlugin extends Plugin {
     private String artist = "";
     private String album = "";
     /**
+     * Raw artwork array exactly as supplied to {@link #setMetadata} (a {@link JSArray}, which extends
+     * {@code org.json.JSONArray}). BRIDGE-THREAD-CONFINED: written in {@link #setMetadata} and read in
+     * {@link #getMetadata}, both running on the Capacitor bridge HandlerThread, so no synchronization
+     * is needed. This is NOT the main-written decoded {@link #artworkData}; it mirrors what the web
+     * {@code getMetadata} getter returns (the original array, not a re-encoding of decoded bytes).
+     */
+    private JSArray artworkMetadata = null;
+    /**
      * Encoded cover art handed to Media3. Written on the main looper (see the artwork-fetch flow in
      * {@link #setMetadata}) and read by the bridge thread in {@link #updateServiceState}, hence
      * {@code volatile}.
@@ -495,13 +503,19 @@ public class MediaSessionPlugin extends Plugin {
 
         final JSArray artworkArray = call.getArray("artwork");
         if (artworkArray == null) {
-            // Artwork key absent: leave any previous cover untouched, push the text update, done.
+            // Artwork key absent: leave any previous cover (and the cached raw array) untouched, push
+            // the text update, done.
             updateServiceState();
             call.resolve();
             return;
         }
 
-        // Artwork key present: select a single src (off-thread fetch) on the main looper so the
+        // Artwork key present (incl. an empty array): cache the raw array verbatim on the bridge
+        // thread (so getMetadata can return it) BEFORE posting the fetch. The absent-key case above
+        // preserves the previous array; this present-key case overwrites it.
+        this.artworkMetadata = artworkArray;
+
+        // Select a single src (off-thread fetch) on the main looper so the
         // artworkData/artworkGeneration single-writer invariant holds. Resolve immediately on the
         // bridge thread — the promise must NOT wait for the (possibly slow) network fetch.
         final List<JSONObject> artworkList = artworkArray.toList();
@@ -657,14 +671,17 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     /**
-     * Read-back getter for the cached metadata TEXT fields. Returns the last {@code title}/
-     * {@code artist}/{@code album} set via {@link #setMetadata}; {@code artwork} is intentionally
-     * OMITTED because only decoded image bytes are cached natively, not the original artwork array.
+     * Read-back getter for the cached metadata. Returns the last {@code title}/{@code artist}/
+     * {@code album} set via {@link #setMetadata}, plus the original {@code artwork} array returned
+     * VERBATIM from the bridge-thread cache (the array as supplied to {@code setMetadata}, NOT a
+     * re-encoding of the decoded image bytes). The {@code artwork} key is omitted only when no
+     * artwork has ever been set (the cache is still {@code null}).
      *
      * <p>SAME-BRIDGE-THREAD invariant: runs on the Capacitor bridge thread and reads
-     * {@code title}/{@code artist}/{@code album}, all WRITTEN on the same bridge thread by
-     * {@link #setMetadata}. {@code artworkData} (written on the MAIN looper) is deliberately NOT read
-     * here, so this getter stays single-thread-confined and needs no synchronization.
+     * {@code title}/{@code artist}/{@code album} and {@link #artworkMetadata}, all WRITTEN on the same
+     * bridge thread by {@link #setMetadata}. The MAIN-written decoded {@link #artworkData} is
+     * deliberately NOT read here, so this getter stays single-thread-confined and needs no
+     * synchronization.
      */
     @PluginMethod
     public void getMetadata(PluginCall call) {
@@ -672,6 +689,9 @@ public class MediaSessionPlugin extends Plugin {
         result.put("title", title);
         result.put("artist", artist);
         result.put("album", album);
+        if (artworkMetadata != null) {
+            result.put("artwork", artworkMetadata);
+        }
         call.resolve(result);
     }
 
@@ -713,6 +733,8 @@ public class MediaSessionPlugin extends Plugin {
         final boolean remove = call.getBoolean("removeHandler", false);
         final String label = call.getString("label");
         final String icon = call.getString("icon");
+        final String iconUri = call.getString("iconUri");
+        final boolean enabled = call.getBoolean("enabled", true);
 
         if (!remove) {
             // Establish the RETURN_CALLBACK keep-alive contract before the call crosses threads, so
@@ -721,7 +743,7 @@ public class MediaSessionPlugin extends Plugin {
             call.setKeepAlive(true);
         }
 
-        mainHandler.post(() -> applyActionHandler(action, remove, label, icon, call));
+        mainHandler.post(() -> applyActionHandler(action, remove, label, icon, iconUri, enabled, call));
     }
 
     /**
@@ -731,7 +753,7 @@ public class MediaSessionPlugin extends Plugin {
      * single main-looper turn so registration and publish settle consistently. For the remove case it
      * also resolves {@code call} here (the bridge prologue intentionally did not).
      */
-    private void applyActionHandler(String action, boolean remove, String label, String icon, PluginCall call) {
+    private void applyActionHandler(String action, boolean remove, String label, String icon, String iconUri, boolean enabled, PluginCall call) {
         final boolean custom = CustomActions.isCustom(action);
 
         // Always release any previously stored kept-alive call for this action before replacing or
@@ -759,7 +781,7 @@ public class MediaSessionPlugin extends Plugin {
             // it at the end (toggle), then store the latest label/icon.
             customActions.remove(action);
             final int iconConstant = CustomActions.iconConstant(icon);
-            customActions.put(action, new CustomActionSpec(action, label, iconConstant));
+            customActions.put(action, new CustomActionSpec(action, label, iconConstant, iconUri, enabled));
         }
 
         // Keep-alive was already set on the bridge thread in setActionHandler.

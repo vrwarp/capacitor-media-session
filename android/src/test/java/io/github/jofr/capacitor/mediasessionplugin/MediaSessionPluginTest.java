@@ -46,6 +46,7 @@ import com.getcapacitor.PluginCall;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ListenableFuture;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.junit.After;
 import org.junit.Before;
@@ -204,6 +205,17 @@ public class MediaSessionPluginTest {
         PluginCall call = mockActionHandlerCall(action);
         when(call.getString("label")).thenReturn(label);
         when(call.getString("icon")).thenReturn(icon);
+        // Production reads getString("iconUri") and getBoolean("enabled", true); keep the defaults
+        // (no iconUri, enabled) so the existing custom-action tests are unaffected.
+        when(call.getString("iconUri")).thenReturn(null);
+        when(call.getBoolean(eq("enabled"), any())).thenReturn(true);
+        return call;
+    }
+
+    private PluginCall mockCustomActionHandlerCall(String action, String label, String icon, String iconUri, boolean enabled) {
+        PluginCall call = mockCustomActionHandlerCall(action, label, icon);
+        when(call.getString("iconUri")).thenReturn(iconUri);
+        when(call.getBoolean(eq("enabled"), any())).thenReturn(enabled);
         return call;
     }
 
@@ -1055,6 +1067,71 @@ public class MediaSessionPluginTest {
         assertEquals("like", result.customLayout.get(0).sessionCommand.customAction);
     }
 
+    // --- Custom action iconUri + enabled (F-1 / F-2) ------------------------------------------
+
+    @Test
+    public void customActionIconUriIsPublishedOnButton() {
+        plugin.setActionHandler(
+                mockCustomActionHandlerCall("like", "Like", null, "content://app/heart.png", true));
+        idleMainLooper();
+
+        CommandButton button = customLayout().get(0);
+        assertNotNull("iconUri should be set on the button", button.iconUri);
+        assertEquals("content://app/heart.png", String.valueOf(button.iconUri));
+    }
+
+    @Test
+    public void customActionIconConstantIsFallbackWhenNoIconUri() {
+        plugin.setActionHandler(mockCustomActionHandlerCall("like", "Like", "heart"));
+        idleMainLooper();
+
+        CommandButton button = customLayout().get(0);
+        // The icon constant stays as a fallback (button.icon reflects it) and no iconUri is layered.
+        assertEquals(CommandButton.ICON_HEART_UNFILLED, button.icon);
+        assertNull("no iconUri when none supplied", button.iconUri);
+    }
+
+    @Test
+    public void customActionEnabledDefaultsTrue() {
+        plugin.setActionHandler(mockCustomActionHandlerCall("like", "Like", "heart"));
+        idleMainLooper();
+
+        CommandButton button = customLayout().get(0);
+        assertTrue("enabled defaults to true", button.isEnabled);
+    }
+
+    @Test
+    public void customActionDisabledButtonReflectsFlag() {
+        plugin.setActionHandler(
+                mockCustomActionHandlerCall("like", "Like", "heart", null, false));
+        idleMainLooper();
+
+        ImmutableList<CommandButton> layout = customLayout();
+        assertEquals("disabled button still present", 1, layout.size());
+        assertFalse("disabled flag reflected on button", layout.get(0).isEnabled);
+    }
+
+    @Test
+    public void reRegisterToggleUpdatesIconUriAndEnabled() {
+        PluginCall first = mockCustomActionHandlerCall("like", "Like", null, "content://a", true);
+        plugin.setActionHandler(first);
+        idleMainLooper();
+
+        PluginCall second = mockCustomActionHandlerCall("like", "Unlike", null, "content://b", false);
+        plugin.setActionHandler(second);
+        idleMainLooper();
+
+        // The previously kept-alive call is released on re-registration.
+        verify(first).release(any());
+
+        ImmutableList<CommandButton> layout = customLayout();
+        assertEquals("re-register replaces (single button)", 1, layout.size());
+        CommandButton button = layout.get(0);
+        assertEquals("Unlike", String.valueOf(button.displayName));
+        assertEquals("content://b", String.valueOf(button.iconUri));
+        assertFalse(button.isEnabled);
+    }
+
     // --- Handler-map thread confinement (R4/R5/R6) ---------------------------------------------
 
     @Test
@@ -1181,8 +1258,59 @@ public class MediaSessionPluginTest {
         assertEquals("Song Title", result.getString("title"));
         assertEquals("Song Artist", result.getString("artist"));
         assertEquals("Song Album", result.getString("album"));
-        // Artwork is intentionally omitted (only decoded bytes are cached natively).
+        // No artwork has ever been set (getArray("artwork") -> null), so the key is omitted.
         assertFalse(result.has("artwork"));
+    }
+
+    @Test
+    public void getMetadataReturnsArtworkArray() throws JSONException {
+        PluginCall setCall = mockMetadataTextCall();
+        JSArray artworkArray = new JSArray();
+        artworkArray.put(new JSObject().put("src", "http://a/1.png").put("sizes", "96x96"));
+        artworkArray.put(new JSObject().put("src", "http://a/2.png").put("sizes", "512x512"));
+        when(setCall.getArray("artwork")).thenReturn(artworkArray);
+        plugin.setMetadata(setCall);
+        idleMainLooper();
+
+        PluginCall call = mock(PluginCall.class);
+        plugin.getMetadata(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        JSObject result = captor.getValue();
+        assertTrue("artwork array should be returned", result.has("artwork"));
+        JSONArray artwork = result.getJSONArray("artwork");
+        assertEquals(2, artwork.length());
+        assertEquals("http://a/1.png", artwork.getJSONObject(0).getString("src"));
+    }
+
+    @Test
+    public void getMetadataPreservesArtworkWhenKeyAbsent() throws JSONException {
+        // First set an artwork array.
+        PluginCall setCall = mockMetadataTextCall();
+        JSArray artworkArray = new JSArray();
+        artworkArray.put(new JSObject().put("src", "http://a/1.png").put("sizes", "96x96"));
+        artworkArray.put(new JSObject().put("src", "http://a/2.png").put("sizes", "512x512"));
+        when(setCall.getArray("artwork")).thenReturn(artworkArray);
+        plugin.setMetadata(setCall);
+        idleMainLooper();
+
+        // Then a text-only update with NO artwork key (getArray -> null) must preserve the array.
+        PluginCall textOnly = mockMetadataTextCall();
+        when(textOnly.getArray("artwork")).thenReturn(null);
+        plugin.setMetadata(textOnly);
+        idleMainLooper();
+
+        PluginCall call = mock(PluginCall.class);
+        plugin.getMetadata(call);
+
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(call).resolve(captor.capture());
+        JSObject result = captor.getValue();
+        assertTrue("artwork preserved when key absent", result.has("artwork"));
+        JSONArray artwork = result.getJSONArray("artwork");
+        assertEquals(2, artwork.length());
+        assertEquals("http://a/1.png", artwork.getJSONObject(0).getString("src"));
     }
 
     @Test

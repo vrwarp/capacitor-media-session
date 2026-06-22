@@ -1,5 +1,6 @@
 package io.github.jofr.capacitor.mediasessionplugin;
 
+import androidx.annotation.Nullable;
 import androidx.media3.session.CommandButton;
 
 import java.util.Arrays;
@@ -81,18 +82,26 @@ final class CustomActions {
 
     /**
      * An ordered specification for a single custom-action button: the action id (also the
-     * {@code SessionCommand.customAction}), its display label, and the resolved Media3 icon
-     * constant.
+     * {@code SessionCommand.customAction}), its display label, the resolved Media3 icon constant,
+     * an optional raw {@code iconUri} string (a custom drawable URI, parsed into an
+     * {@code android.net.Uri} only in the service's {@code buildButton} so this class stays free of
+     * Android URI types) which takes precedence over the icon constant, and whether the button is
+     * enabled (defaults to {@code true} at the call site).
      */
     static final class CustomActionSpec {
         final String id;
         final String label;
         final int iconConstant;
+        @Nullable
+        final String iconUri;
+        final boolean enabled;
 
-        CustomActionSpec(String id, String label, int iconConstant) {
+        CustomActionSpec(String id, String label, int iconConstant, @Nullable String iconUri, boolean enabled) {
             this.id = id;
             this.label = label;
             this.iconConstant = iconConstant;
+            this.iconUri = iconUri;
+            this.enabled = enabled;
         }
     }
 }

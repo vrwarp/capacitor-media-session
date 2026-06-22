@@ -195,9 +195,11 @@ the plugin's own cached value (the most recently set fields), **not** a
 live read of the underlying system media session.
 
 On Web the cache is enriched from `navigator.mediaSession.metadata` when
-available. On Android only the **text** fields (`title`, `artist`,
-`album`) are returned; `artwork` is omitted because only the decoded image
-bytes are cached natively, not the original `artwork` array.
+available. On Android the **text** fields (`title`, `artist`, `album`) are
+returned along with the original `artwork` array returned **verbatim** from
+the cache (the array as supplied to `setMetadata`, not a re-encoding of the
+decoded image bytes); the `artwork` key is omitted only when no artwork has
+ever been set.
 
 **Returns:** <code>Promise&lt;<a href="#metadataoptions">MetadataOptions</a>&gt;</code>
 
@@ -307,11 +309,13 @@ explicitly to reset them.
 
 #### ActionHandlerOptions
 
-| Prop         | Type                                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------ | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`action`** | <code>any</code>                                                          | The action to handle. In addition to the standard [MediaSessionAction](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler) values, any arbitrary string may be passed to register a *custom action*. Custom actions are only surfaced on Android (as an extra button in the media notification / session custom layout); on Web and iOS they are a silent no-op. |
-| **`label`**  | <code>string</code>                                                       | Display label for a *custom action*. Android only. A custom action button is only rendered when a `label` is provided; standard actions ignore this field.                                                                                                                                                                                                                                   |
-| **`icon`**   | <code><a href="#mediasessionactionicon">MediaSessionActionIcon</a></code> | Icon for a *custom action* button. Android only. Maps to one of Media3's built-in `CommandButton` icons; an unknown or missing value falls back to an undefined icon. Standard actions ignore this field.                                                                                                                                                                                    |
+| Prop          | Type                                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`action`**  | <code>any</code>                                                          | The action to handle. In addition to the standard [MediaSessionAction](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setActionHandler) values, any arbitrary string may be passed to register a *custom action*. Custom actions are only surfaced on Android (as an extra button in the media notification / session custom layout); on Web and iOS they are a silent no-op. |
+| **`label`**   | <code>string</code>                                                       | Display label for a *custom action*. Android only. A custom action button is only rendered when a `label` is provided; standard actions ignore this field.                                                                                                                                                                                                                                   |
+| **`icon`**    | <code><a href="#mediasessionactionicon">MediaSessionActionIcon</a></code> | Icon for a *custom action* button. Android only. Maps to one of Media3's built-in `CommandButton` icons; an unknown or missing value falls back to an undefined icon. Standard actions ignore this field.                                                                                                                                                                                    |
+| **`iconUri`** | <code>string</code>                                                       | URI of a custom drawable for a *custom action* button (e.g. a `content://`, `android.resource://` or `file://` URI). Android only; a no-op on Web and iOS. When provided, `iconUri` takes precedence over `icon` for the button's appearance — the `icon` constant is still kept as a fallback. Standard actions ignore this field.                                                          |
+| **`enabled`** | <code>boolean</code>                                                      | Whether a *custom action* button is enabled. Android only; a no-op on Web and iOS. Defaults to `true`. A disabled button is rendered greyed out and non-interactive while its layout slot is preserved. Standard actions ignore this field.                                                                                                                                                  |
 
 
 #### ActionDetails

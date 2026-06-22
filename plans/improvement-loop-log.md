@@ -666,3 +666,107 @@ making "service stays null until idle" observable.
 - **U-2** — Android `getMetadata` omits artwork (only decoded bytes are cached natively; the original
   artwork array / a data-URL round-trip is not returned), an asymmetry vs. the web getter that could be
   documented or closed.
+
+### Iteration 7 — custom-action iconUri + enabled + getMetadata artwork array (closes U-2)
+
+**Shipped** (addresses deferred **F-3** custom-drawable `iconUri` threading [now **F-1**], a new
+per-action **F-2** `enabled` flag, and **U-2** Android `getMetadata` artwork asymmetry). ADDITIVE +
+backward-compatible. Android + `definitions.ts` JSDoc only — no `web.ts`/`index.ts`/`example` change,
+no existing method-signature change on the public TS surface.
+
+- **F-1 — custom-action `iconUri`.** New optional `ActionHandlerOptions.iconUri?: string` (Android
+  only; no-op Web/iOS): a custom drawable URI (e.g. `content://`/`android.resource://`/`file://`).
+  `iconUri` takes precedence over `icon` for the button's appearance on modern controllers, while the
+  `icon` constant is retained as a fallback. `CustomActionSpec` widened with `@Nullable final String
+  iconUri` (kept as a RAW URI string so `CustomActions` stays free of `android.net.Uri`); parsed via
+  `Uri.parse` only in `MediaSessionService.buildButton`, where `builder.setIconUri(...)` layers it on
+  top of the icon-constant builder. `MediaSessionPlugin.setActionHandler` reads
+  `call.getString("iconUri")` into a final on the bridge thread and threads it through
+  `applyActionHandler` → `new CustomActionSpec(action, label, iconConstant, iconUri, enabled)`
+  (customActions stays main-looper-confined).
+- **F-2 — per-action `enabled`.** New optional `ActionHandlerOptions.enabled?: boolean` (Android only;
+  defaults `true`; a disabled button renders greyed/non-interactive with its layout slot kept).
+  `CustomActionSpec` widened with `final boolean enabled`; `buildButton` calls `.setEnabled(spec.enabled)`
+  (was hard-coded `true`). `setActionHandler` reads `call.getBoolean("enabled", true)` into a final and
+  threads it through like `iconUri`.
+- **U-2 — `getMetadata` returns the artwork array.** New bridge-thread-confined field
+  `private JSArray artworkMetadata = null` (the RAW array as supplied to `setMetadata`, mirroring what
+  the web getter returns — NOT the main-written decoded `artworkData`; written and read only on the
+  Capacitor HandlerThread, so no sync). `setMetadata` mirrors the iter-3 absent/present cache semantics:
+  an ABSENT `artwork` key (`getArray` → `null`) PRESERVES the cached array; a PRESENT key (incl. an
+  empty array) sets `this.artworkMetadata = artworkArray` on the bridge thread BEFORE the
+  `mainHandler.post`. `getMetadata` now adds `if (artworkMetadata != null) result.put("artwork",
+  artworkMetadata)` after the text fields (the decoded `artworkData` is still never read here —
+  confinement preserved). The key is omitted only when no artwork has ever been set.
+
+**Deviation from plan**
+
+- `MediaSessionService.buildButton` additionally sets a fallback legacy icon resource
+  (`setCustomIconResId(android.R.drawable.ic_menu_more)`) when an `iconUri` is supplied WITHOUT a
+  built-in icon constant. Media3 1.4.1's legacy `PlaybackStateCompat.CustomAction.Builder` REQUIRES a
+  non-zero `iconResId`; a button with only an `iconUri` has `iconResId == 0` (the no-arg builder yields
+  0, and `CommandButton.Builder(int)` derives `iconResId` from the icon constant, which is 0 for
+  `ICON_UNDEFINED`), so granting commands to a legacy controller threw
+  `IllegalArgumentException: You must specify an icon resource id to build a CustomAction` inside
+  `MediaSession.setAvailableCommands` — surfaced by the two iconUri-only tests (#1, #5). `setCustomIconResId`
+  populates `iconResId` directly and leaves `button.icon` as `ICON_UNDEFINED` and `button.iconUri`
+  carrying the real URI, so the test assertions (and the "iconUri takes precedence, icon constant kept
+  as fallback" contract) hold; the fallback only affects the otherwise-invalid legacy path.
+
+**Files changed**
+
+- `src/definitions.ts` — `ActionHandlerOptions.iconUri`/`enabled` (with JSDoc); `getMetadata` JSDoc
+  updated (Android now returns the original artwork array verbatim from cache, key omitted only when no
+  artwork has ever been set).
+- `android/.../CustomActions.java` — `CustomActionSpec` widened with `@Nullable final String iconUri`
+  + `final boolean enabled` (constructor + `androidx.annotation.Nullable` import).
+- `android/.../MediaSessionService.java` — `android.net.Uri` import; `buildButton` `setIconUri`/
+  `setEnabled(spec.enabled)` + the `FALLBACK_CUSTOM_ICON_RES_ID` legacy-path guard.
+- `android/.../MediaSessionPlugin.java` — `setActionHandler` reads `iconUri`/`enabled` finals;
+  `applyActionHandler` signature + `CustomActionSpec` construction threaded; new bridge-thread-confined
+  `artworkMetadata` field; `setMetadata` caches the raw array (present-key) / preserves it (absent-key);
+  `getMetadata` returns it.
+- `README.md` — regenerated by docgen (new `ActionHandlerOptions` `iconUri`/`enabled` rows +
+  `getMetadata` text); hand-written prose subsections intact (build touched only the docgen-managed
+  blocks).
+- `android/.../MediaSessionPluginTest.java` — `mockCustomActionHandlerCall(action,label,icon)` extended
+  to stub `getString("iconUri")→null` and `getBoolean(eq("enabled"), any())→true`; new overload
+  `mockCustomActionHandlerCall(action,label,icon,iconUri,enabled)`; +7 tests; `org.json.JSONArray` import.
+
+**Test cases added** (Android +7; MediaSessionPluginTest 59 → 66)
+
+- `customActionIconUriIsPublishedOnButton` (button 0 `iconUri != null`, String.valueOf equals
+  `content://app/heart.png`); `customActionIconConstantIsFallbackWhenNoIconUri` (`button.icon ==
+  ICON_HEART_UNFILLED` AND `button.iconUri == null`); `customActionEnabledDefaultsTrue`
+  (`button.isEnabled == true`); `customActionDisabledButtonReflectsFlag` (`enabled:false` →
+  `button.isEnabled == false`, button still present); `reRegisterToggleUpdatesIconUriAndEnabled`
+  (re-register `Like`/`content://a`/enabled → `Unlike`/`content://b`/disabled: single button,
+  displayName "Unlike", iconUri "content://b", isEnabled false, `verify(first).release(any())`);
+  `getMetadataReturnsArtworkArray` (2-entry array → `has("artwork")`, length 2, entry 0 src matches);
+  `getMetadataPreservesArtworkWhenKeyAbsent` (set array, then text-only `getArray→null`, then
+  getMetadata still returns the array).
+- `getMetadataReturnsCachedTextFields` unchanged and still green: its set-call stubs
+  `getArray("artwork")→null`, so no artwork is ever cached and `assertFalse(result.has("artwork"))`
+  holds (absent key → omitted).
+
+**Verification — both required gates green**
+
+- Web (root build): `npm run build` → clean + docgen + tsc + rollup all succeeded (exit 0); README
+  regenerated (new `ActionHandlerOptions` rows + `getMetadata` text), hand-written prose intact.
+  Example vitest not run (no TS/example change).
+- Android: `cd android && ./gradlew test` → `BUILD SUCCESSFUL`; **124 tests, 0 failures / 0 errors**
+  (ArtworkScalingTest 5, ArtworkSelectionTest 13, MediaSessionPluginTest 66, MediaSessionServiceTest 12,
+  WebViewProxyPlayerTest 28).
+
+**Deferred (seeds for the next critic)**
+
+- **R-1** — `data:`-URI artwork robustness: the base64 detection (`url.indexOf(";base64,")`) and the
+  `http`/`blob`/base64 branch ordering in `urlToArtworkData` are loose; a `data:` URI without
+  `;base64,` (percent-encoded) or an odd scheme is silently dropped.
+- **R-2** — `HttpURLConnection` hardening / OOM: no max response size / content-length guard before
+  `BitmapFactory.decodeStream`, no redirect/cap policy; a large or malicious image could OOM the
+  artwork executor thread.
+- **F-4 / R-3 (carried)** — `blob:` artwork URLs still unsupported on Android (decoding TODO); no
+  artwork-failure signal surfaced to JS.
+- **U-3** — no `example/` demo exercising the new `iconUri`/`enabled` custom-action options (the example
+  still only toggles `label`/`icon`); a demo would exercise the round trip end-to-end.
