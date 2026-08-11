@@ -103,6 +103,7 @@ On Android the plugin reads an optional `foregroundService` key from the `MediaS
 * [`getPositionState()`](#getpositionstate)
 * [`addListener('action', ...)`](#addlisteneraction)
 * [`addListener('artworkload', ...)`](#addlistenerartworkload)
+* [`addListener('sessionunavailable', ...)`](#addlistenersessionunavailable)
 * [`setPositionState(...)`](#setpositionstate)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
@@ -317,6 +318,38 @@ Use this to learn the real load outcome — `getMetadata` returns what you
 --------------------
 
 
+### addListener('sessionunavailable', ...)
+
+```typescript
+addListener(eventName: 'sessionunavailable', listenerFunc: (event: SessionUnavailableEvent) => void) => Promise<PluginListenerHandle>
+```
+
+Adds a listener that fires when the Android media session could not be
+created, so this run has **no media notification and no lock-screen or
+hardware-media-button controls**. Audio produced by your app keeps
+playing; only the system-side session is missing.
+
+The plugin retries session creation once before reporting this, and
+reports it instead of throwing — the service is created inside
+`Service.onCreate`, where an exception would kill the whole app process on
+launch. Use it to tell the user their lock-screen controls are gone for
+this session, or to log it.
+
+Android only; it never fires on Web. The event is retained until a
+listener consumes it, because the service binds at plugin-load time —
+well before the web app can register a listener — so a listener added
+later still receives it.
+
+| Param              | Type                                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------- |
+| **`eventName`**    | <code>'sessionunavailable'</code>                                                               |
+| **`listenerFunc`** | <code>(event: <a href="#sessionunavailableevent">SessionUnavailableEvent</a>) =&gt; void</code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
 ### setPositionState(...)
 
 ```typescript
@@ -420,6 +453,16 @@ update from `setMetadata` (see `addListener('artworkload', ...)`).
 | ------------ | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`loaded`** | <code>boolean</code> | Whether the cover artwork was successfully loaded. `false` means the selected image failed to fetch/decode (the displayed cover is cleared) or the supplied `artwork` array had no usable `src`. `true` means an image was loaded and is now the displayed cover. |
 | **`src`**    | <code>string</code>  | The artwork `src` the outcome refers to. When `loaded` is `true` this is the `src` that succeeded; when `false` it is the `src` that was attempted (omitted entirely when the array had no usable `src` to attempt).                                              |
+
+
+#### SessionUnavailableEvent
+
+Payload of the `sessionunavailable` event, reporting that the Android media
+session could not be created (see `addListener('sessionunavailable', ...)`).
+
+| Prop         | Type                | Description                                                                                                                                                                                                                           |
+| ------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`reason`** | <code>string</code> | Why the media session could not be created, as `ExceptionClassName: message` — e.g. `IllegalStateException: Session ID must be unique. ID=MediaSession-0`. Diagnostic text, not a stable API: match on the event, not on this string. |
 
 
 ### Type Aliases

@@ -164,6 +164,20 @@ export interface ArtworkLoadEvent {
     src?: string;
 }
 
+/**
+ * Payload of the `sessionunavailable` event, reporting that the Android media
+ * session could not be created (see `addListener('sessionunavailable', ...)`).
+ */
+export interface SessionUnavailableEvent {
+    /**
+     * Why the media session could not be created, as
+     * `ExceptionClassName: message` — e.g.
+     * `IllegalStateException: Session ID must be unique. ID=MediaSession-0`.
+     * Diagnostic text, not a stable API: match on the event, not on this string.
+     */
+    reason: string;
+}
+
 export interface MediaSessionPlugin {
     /**
      * Sets metadata of the currently playing media. Analogue to setting the
@@ -286,6 +300,27 @@ export interface MediaSessionPlugin {
     addListener(
         eventName: 'artworkload',
         listenerFunc: (event: ArtworkLoadEvent) => void,
+    ): Promise<PluginListenerHandle>;
+    /**
+     * Adds a listener that fires when the Android media session could not be
+     * created, so this run has **no media notification and no lock-screen or
+     * hardware-media-button controls**. Audio produced by your app keeps
+     * playing; only the system-side session is missing.
+     *
+     * The plugin retries session creation once before reporting this, and
+     * reports it instead of throwing — the service is created inside
+     * `Service.onCreate`, where an exception would kill the whole app process on
+     * launch. Use it to tell the user their lock-screen controls are gone for
+     * this session, or to log it.
+     *
+     * Android only; it never fires on Web. The event is retained until a
+     * listener consumes it, because the service binds at plugin-load time —
+     * well before the web app can register a listener — so a listener added
+     * later still receives it.
+     */
+    addListener(
+        eventName: 'sessionunavailable',
+        listenerFunc: (event: SessionUnavailableEvent) => void,
     ): Promise<PluginListenerHandle>;
     /**
      * Update current media playback position, duration and speed. Analogue to
