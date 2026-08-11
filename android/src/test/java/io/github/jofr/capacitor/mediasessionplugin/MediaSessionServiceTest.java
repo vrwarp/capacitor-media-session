@@ -2,6 +2,7 @@ package io.github.jofr.capacitor.mediasessionplugin;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -23,6 +24,9 @@ import androidx.media3.session.SessionResult;
 
 import com.getcapacitor.JSObject;
 import com.google.common.util.concurrent.ListenableFuture;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import org.junit.After;
 import org.junit.Before;
@@ -205,5 +209,90 @@ public class MediaSessionServiceTest {
         JSObject obj = MediaSessionService.bundleToJSObject(null);
         assertNotNull(obj);
         assertEquals(0, obj.length());
+    }
+
+    /**
+     * Fails the first {@code failures} session-creation attempts, the way a
+     * "Session ID must be unique" collision against a not-yet-released prior session does.
+     */
+    static class FlakySessionService extends MediaSessionService {
+        static int failures = 0;
+        int attempts = 0;
+        final List<String> attemptedIds = new ArrayList<>();
+
+        @Override
+        MediaSession createSession(String sessionId) {
+            attempts++;
+            attemptedIds.add(sessionId);
+            if (attempts <= failures) {
+                throw new IllegalStateException("Session ID must be unique. ID=" + sessionId);
+            }
+            return super.createSession(sessionId);
+        }
+    }
+
+    private ServiceController<FlakySessionService> flakyController;
+
+    private FlakySessionService startFlakyService(int failures) {
+        FlakySessionService.failures = failures;
+        flakyController = Robolectric.buildService(FlakySessionService.class).create();
+        return flakyController.get();
+    }
+
+    @After
+    public void tearDownFlaky() {
+        FlakySessionService.failures = 0;
+        if (flakyController != null) {
+            flakyController.destroy();
+            flakyController = null;
+        }
+    }
+
+    @Test
+    public void retriesSessionCreationOnceWithAFreshId() {
+        FlakySessionService service = startFlakyService(1);
+
+        assertEquals("should have retried exactly once", 2, service.attempts);
+        assertNotEquals("the retry must not reuse the colliding id",
+                service.attemptedIds.get(0), service.attemptedIds.get(1));
+        assertNotNull("the retry should have produced a session", service.getMediaSession());
+        assertNull("a recovered session is not a degraded start", service.getSessionFailureReason());
+    }
+
+    @Test
+    public void degradesInsteadOfThrowingWhenSessionCreationKeepsFailing() {
+        // The whole point: this runs inside Service.onCreate, where throwing kills the app process
+        // on launch. Starting without a session must be survivable.
+        FlakySessionService service = startFlakyService(Integer.MAX_VALUE);
+
+        assertEquals("should have tried exactly twice", 2, service.attempts);
+        assertNull("no session could be built", service.getMediaSession());
+        assertNull(service.onGetSession(null));
+        assertNotNull("the degradation must be reportable to JS", service.getSessionFailureReason());
+        assertTrue(service.getSessionFailureReason().contains("IllegalStateException"));
+        assertNotNull("the player is still created so playback state has somewhere to go",
+                service.getPlayer());
+    }
+
+    @Test
+    public void degradedServiceStillBindsAndTakesCustomActionsWithoutCrashing() {
+        FlakySessionService service = startFlakyService(Integer.MAX_VALUE);
+
+        assertNotNull("the local binder must still work so the plugin can connect",
+                service.onBind(new Intent()));
+        // Dropped with a warning rather than NPEing on the absent session.
+        service.updateCustomActions(new ArrayList<>());
+        shadowOf(Looper.getMainLooper()).idle();
+    }
+
+    @Test
+    public void degradedServiceReleasesItsPlayerOnDestroy() {
+        FlakySessionService service = startFlakyService(Integer.MAX_VALUE);
+        assertNotNull(service.getPlayer());
+
+        flakyController.destroy();
+        flakyController = null;
+
+        assertNull("the unowned player must not outlive the service", service.getPlayer());
     }
 }

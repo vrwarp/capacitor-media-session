@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* **A failed media session no longer kills the app (Android).** `MediaSessionService.onCreate` rethrew an `IllegalStateException` from `MediaSession.Builder.build()` / `addSession()` — most plausibly the "Session ID must be unique" collision against a not-yet-released prior session. An exception out of `Service.onCreate` terminates the whole app process, and the plugin binds the service at load time whenever `foregroundService` is `'always'`, so this could kill the host app on launch with no crash dialog. Session creation is now retried once with a fresh id; if it still fails the service starts without a session instead of throwing. A degraded start also releases its unowned proxy player on destroy rather than leaking it.
+
+### Added
+
+* **`addListener('sessionunavailable', …)` (Android)** — reports that the media session could not be created, so the run has no media notification and no lock-screen or hardware-media-button controls. Carries a diagnostic `reason`, and is retained until consumed since the service binds before the web app can register a listener.
+
 ## 4.1.0
 
 ### Added

@@ -11,6 +11,7 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.media3.common.Player;
 import androidx.media3.session.CommandButton;
@@ -59,6 +60,13 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     private MediaSessionPlugin plugin;
 
     /**
+     * Why this service came up without a {@link MediaSession}, or {@code null} when it has one.
+     * Read by the plugin when it binds, to report the degradation to JS.
+     */
+    @Nullable
+    private String sessionFailureReason;
+
+    /**
      * Current ordered custom-action buttons published in the session's custom layout. Kept so a
      * newly connecting controller (via {@link CustomActionsCallback#onConnect}) can be granted the
      * matching session commands and layout. Only mutated on the main looper.
@@ -101,25 +109,83 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
         Log.i(TAG, "onCreate: notificationsEnabled="
                 + NotificationManagerCompat.from(this).areNotificationsEnabled());
 
-        final String sessionId = "MediaSession-" + SESSION_COUNTER.getAndIncrement();
         player = new WebViewProxyPlayer();
-        try {
-            mediaSession = new MediaSession.Builder(this, player)
-                    .setId(sessionId)
-                    .setCallback(sessionCallback)
-                    .build();
-            // Register the session explicitly: it is usually only registered lazily through
-            // onGetSession() when a Media3 controller connects, but the plugin connects through the
-            // local binder instead. Without this call Media3's MediaNotificationManager would never
-            // attach, so the service would never show the media notification or promote itself to a
-            // foreground service.
-            addSession(mediaSession);
-            Log.i(TAG, "onCreate: built and added MediaSession id=" + sessionId);
-        } catch (IllegalStateException e) {
-            Log.e(TAG, "onCreate: building/adding MediaSession id=" + sessionId
-                    + " FAILED (likely a prior session not released — 'Session ID must be unique')", e);
-            throw e;
+
+        // Retry once with a fresh id before giving up: the known failure is the
+        // "Session ID must be unique" collision against a previous session that has not finished
+        // releasing, which a second attempt an instant later usually clears.
+        mediaSession = buildAndAddSession(nextSessionId());
+        if (mediaSession == null) {
+            mediaSession = buildAndAddSession(nextSessionId());
         }
+
+        if (mediaSession == null) {
+            // Deliberately NOT rethrown. This runs inside Service.onCreate, and the plugin binds
+            // the service at bridge-load time whenever foregroundService is "always" — so throwing
+            // here killed the whole app process on launch, with no crash dialog and nothing to
+            // distinguish it from the app simply vanishing. Starting sessionless costs the media
+            // notification and lock-screen controls for this run; playback itself is produced by
+            // the WebView and keeps working. The reason is surfaced to JS as `sessionunavailable`
+            // once the plugin binds.
+            Log.e(TAG, "onCreate: no MediaSession after retry — starting DEGRADED (no media "
+                    + "notification, no lock-screen controls) instead of taking the app down. "
+                    + "reason=" + sessionFailureReason);
+        } else {
+            sessionFailureReason = null;
+        }
+    }
+
+    private String nextSessionId() {
+        return "MediaSession-" + SESSION_COUNTER.getAndIncrement();
+    }
+
+    /**
+     * Builds a session under {@code sessionId} and registers it, returning {@code null} (rather
+     * than throwing) when either step fails.
+     *
+     * Registration is explicit because the session is otherwise only registered lazily through
+     * {@link #onGetSession} when a Media3 controller connects, and the plugin connects through the
+     * local binder instead. Without it Media3's MediaNotificationManager would never attach, so the
+     * service would never show the media notification or promote itself to a foreground service.
+     */
+    @Nullable
+    private MediaSession buildAndAddSession(String sessionId) {
+        MediaSession session = null;
+        try {
+            session = createSession(sessionId);
+            addSession(session);
+            Log.i(TAG, "onCreate: built and added MediaSession id=" + sessionId);
+            return session;
+        } catch (RuntimeException e) {
+            // Broad by design: every RuntimeException out of Service.onCreate is an app-wide
+            // process kill, and none of them is worth that. IllegalStateException
+            // ("Session ID must be unique") is the one we know about.
+            Log.e(TAG, "onCreate: building/adding MediaSession id=" + sessionId + " FAILED", e);
+            sessionFailureReason = e.getClass().getSimpleName()
+                    + (e.getMessage() != null ? ": " + e.getMessage() : "");
+            if (session != null) {
+                // build() succeeded and addSession() threw: release it, or its id stays taken and
+                // the retry collides on the very same thing.
+                try {
+                    session.release();
+                } catch (RuntimeException releaseError) {
+                    Log.w(TAG, "onCreate: releasing the half-registered session failed", releaseError);
+                }
+            }
+            return null;
+        }
+    }
+
+    /**
+     * The raw Media3 session construction. Package-private and isolated so tests can drive the
+     * failure/retry paths without provoking a real id collision.
+     */
+    @VisibleForTesting
+    MediaSession createSession(String sessionId) {
+        return new MediaSession.Builder(this, player)
+                .setId(sessionId)
+                .setCallback(sessionCallback)
+                .build();
     }
 
     /**
@@ -192,8 +258,12 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
             mediaSession.getPlayer().release();
             mediaSession.release();
             mediaSession = null;
-            player = null;
+        } else if (player != null) {
+            // Degraded start: no session ever owned the player, so release it here rather than
+            // leaking it for the lifetime of the process.
+            player.release();
         }
+        player = null;
         super.onDestroy();
     }
 
@@ -215,6 +285,16 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
     /** Registers the plugin so custom-command taps can be routed back to its JS handlers. */
     public void setPlugin(@Nullable MediaSessionPlugin plugin) {
         this.plugin = plugin;
+    }
+
+    /**
+     * Non-null when this service started WITHOUT a media session — the media notification and
+     * lock-screen controls are unavailable for its lifetime, but the app was not killed. The
+     * plugin reads this when it binds and reports it to JS as {@code sessionunavailable}.
+     */
+    @Nullable
+    public String getSessionFailureReason() {
+        return sessionFailureReason;
     }
 
     /**

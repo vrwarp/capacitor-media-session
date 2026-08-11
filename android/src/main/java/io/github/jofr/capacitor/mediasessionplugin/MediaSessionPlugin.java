@@ -12,6 +12,8 @@ import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 
+import androidx.annotation.Nullable;
+
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -220,6 +222,7 @@ public class MediaSessionPlugin extends Plugin {
             MediaSessionService.LocalBinder binder = (MediaSessionService.LocalBinder) iBinder;
             service = binder.getService();
             service.setPlugin(MediaSessionPlugin.this);
+            notifySessionUnavailable(service.getSessionFailureReason());
             WebViewProxyPlayer player = service.getPlayer();
             if (player != null) {
                 player.setActionCallback(MediaSessionPlugin.this::onPlayerAction);
@@ -812,6 +815,25 @@ public class MediaSessionPlugin extends Plugin {
             event.put("src", src);
         }
         notifyListeners("artworkload", event);
+    }
+
+    /**
+     * Emits the {@code sessionunavailable} event when the bound service came up without a media
+     * session (see the TS {@code addListener('sessionunavailable', ...)} overload). A no-op when
+     * {@code reason} is null, i.e. the normal case.
+     *
+     * Retained until consumed: the service is bound from {@link #load}, at bridge-init time, so
+     * this fires long before the web app has had a chance to register a listener. Without
+     * retention the one event that explains the missing notification would always be dropped.
+     */
+    private void notifySessionUnavailable(@Nullable String reason) {
+        if (reason == null) {
+            return;
+        }
+        Log.w(TAG, "notifySessionUnavailable: reporting degraded media session to JS — " + reason);
+        JSObject event = new JSObject();
+        event.put("reason", reason);
+        notifyListeners("sessionunavailable", event, true);
     }
 
     @PluginMethod
