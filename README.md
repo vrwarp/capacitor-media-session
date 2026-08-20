@@ -124,6 +124,10 @@ Sets metadata of the currently playing media. Analogue to setting the
 interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/metadata)
 when using the Media Session API directly.
 
+Omitted fields **preserve** their previously set values on every platform
+(partial updates merge): `setMetadata({ artist: 'X' })` keeps the earlier
+`title` and cover artwork in the system UI.
+
 On Android, artwork handling differs from the Web API: only a **single**
 `artwork` entry is fetched, selected by its `sizes` (the smallest image at
 least ~512px, otherwise the largest available). Fetching is
@@ -133,7 +137,9 @@ array whose selected image fails to load **clears** any previously shown
 cover, whereas omitting the `artwork` property entirely **preserves** it.
 The selected artwork `src` may be an `http(s)://` URL (fetched, with large
 images downsampled) or a `data:` URI (base64 or percent-encoded); `blob:`
-URLs are not supported on Android.
+URLs are not supported on Android. Encoded artwork payloads are capped at
+8 MB (HTTP and `data:` alike); anything larger is treated as a failed
+load.
 
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |
@@ -152,6 +158,10 @@ Indicate whether media is playing or not. Analogue to setting the
 [playbackState property of the MediaSession
 interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/playbackState)
 when using the Media Session API directly.
+
+The promise **rejects** for values other than `'none'`, `'paused'` or
+`'playing'` on every platform (browsers throw a `TypeError`; Android
+validates for parity).
 
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |
@@ -361,9 +371,15 @@ calling [setPositionState() of the MediaSession
 interface](https://developer.mozilla.org/en-US/docs/Web/API/MediaSession/setPositionState)
 when using the Media Session API directly.
 
-On Android, omitting `duration`, `position` or `playbackRate`
-**preserves** the previously set value for that field; pass `0` / `0` / `1`
-explicitly to reset them.
+Omitting `duration`, `position` or `playbackRate` **preserves** the
+previously set value for that field on every platform (so a position-only
+update per tick is fine); pass `0` / `0` / `1` explicitly to reset them.
+
+Non-finite values (e.g. `Infinity` for live media) cannot cross the
+native JSON bridge: on Android they behave like omitted fields, and the
+native layer additionally guards its timeline against non-finite input
+(a never-set duration renders as an indeterminate timeline). On Web,
+`Infinity` is handed to the browser unchanged.
 
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |

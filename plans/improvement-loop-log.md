@@ -1109,3 +1109,55 @@ critics surfaced) has been addressed:
 
 The plugin keeps both TypeScript and Android surfaces in sync, stays backward-compatible with the
 Media Session Web API, and degrades gracefully on Web/iOS throughout.
+
+## Production-readiness pass (post-loop)
+
+A dedicated hardening pass on top of the completed 10-iteration loop, focused on **test
+coverage**, **failure resilience**, and **performance** ahead of wide deployment.
+
+**Test coverage**
+
+- **TS layer now has real unit tests** (the loop's deferred "web unit harness"): root
+  vitest + jsdom suite (`npm test`) with a spec-faithful `navigator.mediaSession` /
+  `MediaMetadata` fake — 35 tests, 100% line/branch coverage of `src/web.ts` and the
+  `src/index.ts` Proxy (removeHandler translation, event wrapping, every unavailable path).
+  Wired into CI and `verify:web`; `prepublishOnly` path gated via the publish workflow.
+- **`httpToArtworkData` socket loop now tested for real** (the loop's deferred MockWebServer
+  item, still with no new dependency): `ArtworkHttpFetchTest` drives the actual fetch over
+  loopback sockets against a minimal hand-rolled `java.net.ServerSocket` server — 200 decode +
+  downsample, relative/absolute redirect chains, hop-cap boundary (5 ok / 6 abort),
+  redirect-loop visited-set guard (first revisit, one hit per URL), non-200, Content-Length
+  fast-fail, streaming-cap abort, connection refused. Android suite: 160 → 195 tests.
+
+**Resilience fixes**
+
+- `setMetadata` artwork arrays are filtered to `JSONObject` entries on the bridge thread
+  (`jsonObjectEntries`); `artwork: ["url"]` from plain JS used to `ClassCastException` on the
+  main looper and kill the app.
+- `startMediaService` handles `bindService` returning false or throwing (`SecurityException`):
+  releases the connection and resets `serviceBindingRequested` so the next playing state
+  retries — previously the flag wedged true and the session was dead for the app run.
+  `onServiceDisconnected` keeps the (still live) binding bookkeeping; new `onBindingDied`
+  (release + rebind) and `onNullBinding` (release) recovery.
+- `data:` artwork URIs honor `MAX_ARTWORK_BYTES` (string-length pre-guard + decoded byte cap),
+  closing the doc/code mismatch where only HTTP was capped.
+- `WebViewProxyPlayer` guards non-representable times (`isRepresentableTime`): JS
+  `duration: Infinity` (live streams) previously overflowed the µs timeline into a negative
+  duration; NaN/Infinity playback rates now fall back to 1x.
+- Android `setPlaybackState` validates none/paused/playing and rejects otherwise (parity with
+  the browser TypeError).
+- Destroyed-guard hardening: `applyActionHandler` releases late kept-alive calls,
+  `actionCallback` drops late taps, `stopMediaService` detaches the service's plugin back-ref.
+- Web parity: merged metadata/position caches are what get handed to the browser (partial
+  `setMetadata` no longer wipes omitted fields; position-only `setPositionState` no longer
+  throws); the wrapped action handler emits the `action` event via try/finally.
+
+**Performance**
+
+- `WebViewProxyPlayer` caches its built `MediaMetadata`, invalidated only when
+  title/artist/album/artwork change — steady-state position ticks no longer rebuild it and
+  re-clone the artwork bytes on every `getState()`.
+
+**Verification** — all gates green: `npm run build` (docgen/tsc/rollup), root `npm test`
+(35/35), `cd android && ./gradlew clean build test` (195 tests, 0 failures), example vitest
+(18/18) and example vite build. Version bumped to 4.2.0 with a full CHANGELOG entry.

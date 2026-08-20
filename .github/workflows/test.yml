@@ -28,6 +28,9 @@ jobs:
     - name: Install dependencies
       run: npm install
 
+    - name: Run plugin web unit tests
+      run: npm test
+
     - name: Verify Web and Android Code
       run: npm run verify
 
