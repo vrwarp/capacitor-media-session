@@ -2,7 +2,10 @@ package io.github.jofr.capacitor.mediasessionplugin;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -144,5 +147,33 @@ public class ArtworkSelectionTest {
                 entry("first512", "512x512"),
                 entry("second512", "512x512"));
         assertEquals("second512", MediaSessionPlugin.selectArtworkSrc(artwork, TARGET));
+    }
+
+    // --- jsonObjectEntries: defensive extraction of the artwork array ---------------------------
+
+    @Test
+    public void jsonObjectEntriesKeepsOnlyObjectsInOrder() throws JSONException {
+        JSONArray array = new JSONArray();
+        array.put("https://example.com/plain-string.png");
+        JSONObject first = new JSONObject().put("src", "a.png");
+        array.put(first);
+        array.put(7);
+        array.put(true);
+        array.put(JSONObject.NULL);
+        JSONObject second = new JSONObject().put("src", "b.png");
+        array.put(second);
+        array.put(new JSONArray());
+
+        List<JSONObject> entries = MediaSessionPlugin.jsonObjectEntries(array);
+
+        assertEquals(2, entries.size());
+        assertSame(first, entries.get(0));
+        assertSame(second, entries.get(1));
+    }
+
+    @Test
+    public void jsonObjectEntriesHandlesNullAndEmptyArrays() {
+        assertTrue(MediaSessionPlugin.jsonObjectEntries(null).isEmpty());
+        assertTrue(MediaSessionPlugin.jsonObjectEntries(new JSONArray()).isEmpty());
     }
 }

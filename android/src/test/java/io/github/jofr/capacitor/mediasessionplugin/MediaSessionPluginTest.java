@@ -9,6 +9,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -242,7 +243,7 @@ public class MediaSessionPluginTest {
      */
     private void setPlaybackStateNoIdle(String state) {
         PluginCall call = mock(PluginCall.class);
-        when(call.getString(eq("playbackState"), anyString())).thenReturn(state);
+        when(call.getString("playbackState")).thenReturn(state);
         plugin.setPlaybackState(call);
     }
 
@@ -525,7 +526,7 @@ public class MediaSessionPluginTest {
         // resolve() happens synchronously on the bridge thread; the bind decision is deferred to the
         // main looper, so the service is not bound until the looper is idled.
         PluginCall call = mock(PluginCall.class);
-        when(call.getString(eq("playbackState"), anyString())).thenReturn("playing");
+        when(call.getString("playbackState")).thenReturn("playing");
         plugin.setPlaybackState(call);
 
         verify(call).resolve();
@@ -1599,5 +1600,261 @@ public class MediaSessionPluginTest {
         idleMainLooper(); // any late result-delivery runnable must be dropped by the destroyed guard
 
         verify(listenerCall, never()).resolve(any(JSObject.class));
+    }
+
+    // --- malformed artwork input (crash hardening) ---------------------------------------------
+
+    @Test
+    public void setMetadataWithNonObjectArtworkEntriesDoesNotCrash() throws JSONException {
+        PluginCall call = mockMetadataTextCall();
+        JSArray artworkArray = new JSArray();
+        artworkArray.put("https://example.com/plain-string-entry.png"); // JS: artwork: ["url"]
+        artworkArray.put(42);
+        artworkArray.put(org.json.JSONObject.NULL);
+        artworkArray.put(new JSObject().put("src", createPngDataUrl(64, 64)));
+        when(call.getArray("artwork")).thenReturn(artworkArray);
+
+        plugin.setMetadata(call);
+        drainArtwork(); // previously: ClassCastException on the main looper → app crash
+
+        byte[] artworkData = player.getMediaMetadata().artworkData;
+        assertNotNull("the one well-formed entry should still be selected", artworkData);
+        verify(call).resolve();
+    }
+
+    @Test
+    public void setMetadataWithOnlyNonObjectArtworkEntriesClearsCover() throws JSONException {
+        plugin.setMetadata(mockMetadataCallWithArtwork(createPngDataUrl(64, 64)));
+        drainArtwork();
+        assertNotNull(player.getMediaMetadata().artworkData);
+
+        PluginCall call = mockMetadataTextCall();
+        JSArray artworkArray = new JSArray();
+        artworkArray.put("just-a-string.png");
+        artworkArray.put(false);
+        when(call.getArray("artwork")).thenReturn(artworkArray);
+
+        plugin.setMetadata(call);
+        drainArtwork();
+
+        // Same rule as an empty/unusable array: the supplied array's outcome (nothing usable)
+        // replaces the previous cover.
+        assertNull(player.getMediaMetadata().artworkData);
+        verify(call).resolve();
+    }
+
+    // --- data: URI size caps -------------------------------------------------------------------
+
+    @Test
+    public void oversizedDataUriStringIsRejectedBeforeDecoding() throws JSONException {
+        plugin.setMetadata(mockMetadataCallWithArtwork(createPngDataUrl(64, 64)));
+        drainArtwork();
+        assertNotNull(player.getMediaMetadata().artworkData);
+
+        char[] pad = new char[MediaSessionPlugin.DATA_URI_MAX_LENGTH + 8];
+        java.util.Arrays.fill(pad, 'A');
+        String oversized = "data:image/png;base64," + new String(pad);
+
+        plugin.setMetadata(mockMetadataCallWithArtwork(oversized));
+        drainArtwork();
+
+        assertNull(player.getMediaMetadata().artworkData);
+    }
+
+    @Test
+    public void dataUriDecodingOverTheByteCapClearsCover() throws JSONException {
+        plugin.setMetadata(mockMetadataCallWithArtwork(createPngDataUrl(64, 64)));
+        drainArtwork();
+        assertNotNull(player.getMediaMetadata().artworkData);
+
+        // Percent-encoded body: 1 char/byte, so the string passes the pre-decode length guard but
+        // the decoded payload exceeds MAX_ARTWORK_BYTES and must be dropped by the byte cap.
+        char[] payload = new char[MediaSessionPlugin.MAX_ARTWORK_BYTES + 1];
+        java.util.Arrays.fill(payload, 'A');
+        String overCap = "data:image/png," + new String(payload);
+
+        plugin.setMetadata(mockMetadataCallWithArtwork(overCap));
+        drainArtwork();
+
+        assertNull(player.getMediaMetadata().artworkData);
+    }
+
+    // --- setPlaybackState input validation -----------------------------------------------------
+
+    @Test
+    public void setPlaybackStateRejectsInvalidValue() {
+        setPlaybackState("playing");
+
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("playbackState")).thenReturn("bogus");
+        plugin.setPlaybackState(call);
+        idleMainLooper();
+
+        verify(call).reject(anyString());
+        verify(call, never()).resolve();
+
+        // The cached state must be untouched by the rejected call.
+        PluginCall get = mock(PluginCall.class);
+        plugin.getPlaybackState(get);
+        ArgumentCaptor<JSObject> captor = ArgumentCaptor.forClass(JSObject.class);
+        verify(get).resolve(captor.capture());
+        assertEquals("playing", captor.getValue().getString("playbackState"));
+    }
+
+    @Test
+    public void setPlaybackStateRejectsMissingValue() {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("playbackState")).thenReturn(null);
+        plugin.setPlaybackState(call);
+        idleMainLooper();
+
+        verify(call).reject(anyString());
+        verify(call, never()).resolve();
+    }
+
+    // --- service binding failure recovery ------------------------------------------------------
+
+    /** Bridge whose Context fails bindService; getPackageName stubbed for Intent construction. */
+    private Context mockFailingBindContext() {
+        Context failing = mock(Context.class);
+        when(failing.getPackageName()).thenReturn("io.github.jofr.capacitor.mediasessionplugin.test");
+        return failing;
+    }
+
+    private void useContext(Context context) {
+        Bridge bridge = mock(Bridge.class);
+        when(bridge.getContext()).thenReturn(context);
+        plugin.setBridge(bridge);
+    }
+
+    @Test
+    public void bindServiceReturningFalseResetsBindingStateAndAllowsRetry() throws Exception {
+        // Settle into an unbound state first.
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+        assertNull(getPluginField("service"));
+
+        Context failing = mockFailingBindContext();
+        when(failing.bindService(any(Intent.class), any(ServiceConnection.class), anyInt())).thenReturn(false);
+        useContext(failing);
+
+        setPlaybackState("playing");
+
+        // The failed bind must not wedge the flag — that would no-op every future bind attempt.
+        assertEquals(Boolean.FALSE, getPluginField("serviceBindingRequested"));
+        assertNull(getPluginField("service"));
+        // The connection is released per the bindService contract (a false return can keep it).
+        verify(failing).unbindService(any(ServiceConnection.class));
+
+        // With a working context again, the next playing state binds successfully.
+        useContext(ApplicationProvider.getApplicationContext());
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+    }
+
+    @Test
+    public void bindServiceThrowingSecurityExceptionIsHandled() throws Exception {
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+        assertNull(getPluginField("service"));
+
+        Context failing = mockFailingBindContext();
+        when(failing.bindService(any(Intent.class), any(ServiceConnection.class), anyInt()))
+                .thenThrow(new SecurityException("background bind denied"));
+        useContext(failing);
+
+        setPlaybackState("playing"); // must not crash
+
+        assertEquals(Boolean.FALSE, getPluginField("serviceBindingRequested"));
+        assertNull(getPluginField("service"));
+
+        useContext(ApplicationProvider.getApplicationContext());
+        setPlaybackState("playing");
+        assertNotNull(getPluginField("service"));
+    }
+
+    @Test
+    public void serviceDisconnectKeepsBindingBookkeepingForReconnect() throws Exception {
+        setPluginField("serviceBindingRequested", true);
+        ServiceConnection connection = getServiceConnection();
+
+        connection.onServiceDisconnected(
+                new ComponentName(ApplicationProvider.getApplicationContext(), MediaSessionService.class));
+
+        // The binding survives a service-process death (the framework reconnects), so the flag must
+        // stay true — otherwise a later stopMediaService would skip unbindService and leak the
+        // connection.
+        assertNull(getPluginField("service"));
+        assertEquals(Boolean.TRUE, getPluginField("serviceBindingRequested"));
+    }
+
+    @Test
+    public void nullBindingReleasesConnectionState() throws Exception {
+        setPluginField("serviceBindingRequested", true);
+        ServiceConnection connection = getServiceConnection();
+
+        connection.onNullBinding(
+                new ComponentName(ApplicationProvider.getApplicationContext(), MediaSessionService.class));
+
+        assertEquals(Boolean.FALSE, getPluginField("serviceBindingRequested"));
+        assertNull(getPluginField("service"));
+    }
+
+    @Test
+    public void bindingDiedReleasesAndRebindsService() throws Exception {
+        ServiceConnection connection = getServiceConnection();
+
+        connection.onBindingDied(
+                new ComponentName(ApplicationProvider.getApplicationContext(), MediaSessionService.class));
+        idleMainLooper();
+
+        // The dead binding is replaced by a fresh one (Robolectric delivers the registered binder).
+        assertNotNull(getPluginField("service"));
+        assertEquals(Boolean.TRUE, getPluginField("serviceBindingRequested"));
+    }
+
+    // --- destroyed-guard hardening -------------------------------------------------------------
+
+    @Test
+    public void actionCallbackAfterDestroyIsDropped() throws Exception {
+        PluginCall handlerCall = mockActionHandlerCall("play");
+        plugin.setActionHandler(handlerCall);
+        PluginCall listenerCall = mockListenerCall("action");
+        plugin.addListener(listenerCall);
+        idleMainLooper();
+
+        plugin.handleOnDestroy();
+        idleMainLooper();
+
+        plugin.actionCallback("play"); // late controller tap racing the teardown
+
+        verify(handlerCall, never()).resolve(any(JSObject.class));
+        verify(listenerCall, never()).resolve(any(JSObject.class));
+    }
+
+    @Test
+    public void setActionHandlerAfterDestroyReleasesCallWithoutRegistering() throws Exception {
+        plugin.handleOnDestroy();
+        idleMainLooper();
+
+        PluginCall call = mockActionHandlerCall("play");
+        plugin.setActionHandler(call);
+        idleMainLooper();
+
+        verify(call).release(any());
+        assertFalse(plugin.hasActionHandler("play"));
+    }
+
+    @Test
+    public void serviceTeardownDetachesThePluginBackReference() throws Exception {
+        Field pluginField = MediaSessionService.class.getDeclaredField("plugin");
+        pluginField.setAccessible(true);
+        assertSame(plugin, pluginField.get(service));
+
+        setPlaybackState("none");
+        idleMainFor(SERVICE_TEARDOWN_DELAY_MS() + 50);
+
+        // A controller tap arriving after teardown must find no plugin to route into.
+        assertNull(pluginField.get(service));
     }
 }
