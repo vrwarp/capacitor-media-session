@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -70,6 +71,17 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
     private double playbackRate = 1.0;
     private Set<String> supportedActions = new HashSet<>();
 
+    /**
+     * Built {@link MediaMetadata} for the current title/artist/album/artwork, or {@code null} when
+     * it must be rebuilt. {@link #getState()} runs on every state invalidation AND position tick;
+     * without this cache each call re-built the metadata and re-cloned the artwork byte array
+     * (~50–150 KB) even when only the position changed. Invalidated by {@link #updateSessionState}
+     * whenever one of its inputs changes; accessed only on the application looper like all other
+     * player state.
+     */
+    @Nullable
+    private MediaMetadata cachedMediaMetadata = null;
+
     public WebViewProxyPlayer() {
         super(Looper.getMainLooper());
     }
@@ -93,6 +105,16 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         double playbackRate,
         Set<String> supportedActions
     ) {
+        // Invalidate the cached MediaMetadata only when one of its inputs changed, so
+        // position/state-only updates (the steady-state per-second tick) reuse the built instance.
+        // The artwork comparison is by reference on purpose: the plugin re-fetches into a NEW array
+        // whenever the artwork changes and re-passes the same array otherwise.
+        if (!Objects.equals(this.title, title)
+                || !Objects.equals(this.artist, artist)
+                || !Objects.equals(this.album, album)
+                || this.artworkData != artworkData) {
+            cachedMediaMetadata = null;
+        }
         this.playbackState = playbackState;
         this.title = title;
         this.artist = artist;
@@ -146,9 +168,18 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
             commands.add(Player.COMMAND_STOP);
         }
 
-        final MediaMetadata mediaMetadata = buildMediaMetadata();
-        final long durationMs = duration > 0.0 ? Math.round(duration * 1000.0) : C.TIME_UNSET;
-        long positionMs = Math.max(0, Math.round(position * 1000.0));
+        if (cachedMediaMetadata == null) {
+            cachedMediaMetadata = buildMediaMetadata();
+        }
+        final MediaMetadata mediaMetadata = cachedMediaMetadata;
+
+        // Non-finite and absurd values must never reach the Media3 timeline: JS can hand us
+        // duration = Infinity for live streams (per the Media Session spec), and Math.round would
+        // saturate it to Long.MAX_VALUE, overflowing the microsecond conversion below into a
+        // negative duration. Treat anything non-representable as "no duration" (live/indeterminate),
+        // and clamp the position the same way.
+        final long durationMs = isRepresentableTime(duration) ? Math.round(duration * 1000.0) : C.TIME_UNSET;
+        long positionMs = isRepresentableTime(position) ? Math.round(position * 1000.0) : 0L;
         if (durationMs != C.TIME_UNSET) {
             positionMs = Math.min(positionMs, durationMs);
         }
@@ -174,7 +205,9 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
             playlist.add(new MediaItemData.Builder(NEXT_ITEM_UID).build());
         }
 
-        final float speed = playbackRate > 0.0 ? (float) playbackRate : 1.0f;
+        // NaN/Infinity playback rates fall back to 1x: Media3's PlaybackParameters accepts any
+        // speed > 0, so an Infinity would pass its check and blow up position extrapolation.
+        final float speed = (Double.isFinite(playbackRate) && playbackRate > 0.0) ? (float) playbackRate : 1.0f;
         final PositionSupplier positionSupplier = playing
             ? PositionSupplier.getExtrapolating(positionMs, speed)
             : PositionSupplier.getConstant(positionMs);
@@ -190,6 +223,19 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
             .setSeekBackIncrementMs(SEEK_BACK_INCREMENT_MS)
             .setPlaybackParameters(new PlaybackParameters(speed))
             .build();
+    }
+
+    /**
+     * Largest time (seconds) that survives the seconds → milliseconds → microseconds conversions
+     * into Media3's timeline without overflowing a {@code long}. Values at or above it (notably
+     * {@code Infinity}, which JS uses for live streams) are treated as unset/zero by
+     * {@link #isRepresentableTime}.
+     */
+    static final double MAX_REPRESENTABLE_TIME_SECONDS = Long.MAX_VALUE / 1_000_000.0;
+
+    /** Whether {@code seconds} is a finite, positive time that fits Media3's microsecond timeline. */
+    static boolean isRepresentableTime(double seconds) {
+        return seconds > 0.0 && seconds < MAX_REPRESENTABLE_TIME_SECONDS;
     }
 
     private MediaMetadata buildMediaMetadata() {

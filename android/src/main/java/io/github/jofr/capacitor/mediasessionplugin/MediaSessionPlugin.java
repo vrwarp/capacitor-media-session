@@ -65,7 +65,7 @@ public class MediaSessionPlugin extends Plugin {
      * itself is additionally downsampled (see {@link #computeInSampleSize(int, int, int)}), but this
      * cap bounds the raw buffer that must be held in memory in the first place.
      */
-    private static final int MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
+    static final int MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
 
     /**
      * Maximum number of HTTP redirects {@link #httpToArtworkData(String)} will follow before giving
@@ -74,6 +74,15 @@ public class MediaSessionPlugin extends Plugin {
      * otherwise refuse to follow silently.
      */
     private static final int MAX_ARTWORK_REDIRECTS = 5;
+
+    /**
+     * Longest {@code data:} URI STRING accepted before decoding. Base64 inflates its payload by 4/3,
+     * so this admits any base64 body that can still fit {@link #MAX_ARTWORK_BYTES} (plus slack for
+     * the metadata header) while rejecting a runaway URI BEFORE any large decode buffer is
+     * allocated. The exact byte cap is enforced again after decoding, because a percent-encoded body
+     * can be denser than 4/3 chars per byte.
+     */
+    static final int DATA_URI_MAX_LENGTH = MAX_ARTWORK_BYTES / 3 * 4 + 1024;
 
     private boolean startServiceOnlyDuringPlayback = true;
 
@@ -234,9 +243,45 @@ public class MediaSessionPlugin extends Plugin {
 
         @Override
         public void onServiceDisconnected(ComponentName componentName) {
-            Log.d(TAG, "Disconnected from MediaSessionService");
+            // The service process went away but the BINDING is still registered (the framework
+            // redelivers onServiceConnected if the service comes back), so serviceBindingRequested
+            // stays true — clearing it here would make a later stopMediaService skip unbindService
+            // and leak the connection.
+            Log.d(TAG, "Disconnected from MediaSessionService (binding kept for reconnect)");
             service = null;
+        }
+
+        @Override
+        public void onBindingDied(ComponentName componentName) {
+            // The binding itself is dead (e.g. the hosting package was updated). Release it and
+            // rebind so media controls come back without waiting for an app restart.
+            Log.w(TAG, "onBindingDied: releasing dead binding and rebinding MediaSessionService");
+            service = null;
+            if (serviceBindingRequested) {
+                try {
+                    getContext().unbindService(serviceConnection);
+                } catch (IllegalArgumentException e) {
+                    Log.d(TAG, "onBindingDied: connection was not registered", e);
+                }
+                serviceBindingRequested = false;
+            }
+            if (!destroyed) {
+                startMediaService();
+            }
+        }
+
+        @Override
+        public void onNullBinding(ComponentName componentName) {
+            // The service refused the binding (onBind returned null). Keeping the dead connection
+            // registered would leak it and block every future bind attempt behind the stale flag.
+            Log.e(TAG, "onNullBinding: MediaSessionService returned no binder — releasing connection");
+            try {
+                getContext().unbindService(serviceConnection);
+            } catch (IllegalArgumentException e) {
+                Log.d(TAG, "onNullBinding: connection was not registered", e);
+            }
             serviceBindingRequested = false;
+            service = null;
         }
     };
 
@@ -261,6 +306,12 @@ public class MediaSessionPlugin extends Plugin {
     /**
      * Binds the {@link MediaSessionService}. MUST be called on the main looper (it reads/writes
      * {@link #service} and {@link #serviceBindingRequested}, which are main-looper-confined).
+     *
+     * <p>A failed bind — {@code bindService} returning {@code false} or throwing (e.g.
+     * {@code SecurityException} under OEM background restrictions) — must NOT leave
+     * {@code serviceBindingRequested} stuck at {@code true}: that would make every future call a
+     * no-op and permanently kill the media session for this app run. On failure the connection is
+     * released and the flag reset so the next {@code playing} state retries the bind.
      */
     private void startMediaService() {
         if (serviceBindingRequested) {
@@ -269,7 +320,24 @@ public class MediaSessionPlugin extends Plugin {
         serviceBindingRequested = true;
         Log.i(TAG, "startMediaService: bindService(MediaSessionService, BIND_AUTO_CREATE)");
         Intent intent = new Intent(getContext(), MediaSessionService.class);
-        getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
+        boolean bound;
+        try {
+            bound = getContext().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "startMediaService: bindService threw — no media session for now, will retry"
+                    + " on the next playback state change", e);
+            bound = false;
+        }
+        if (!bound) {
+            // Per the bindService contract a false return can still hold the connection open.
+            Log.e(TAG, "startMediaService: bind failed — releasing connection and resetting state");
+            try {
+                getContext().unbindService(serviceConnection);
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                Log.d(TAG, "startMediaService: connection was not registered after failed bind", e);
+            }
+            serviceBindingRequested = false;
+        }
     }
 
     /**
@@ -278,6 +346,11 @@ public class MediaSessionPlugin extends Plugin {
      * main-looper-confined).
      */
     private void stopMediaService() {
+        if (service != null) {
+            // Detach the back-reference first so a controller tap racing the teardown cannot route
+            // into a plugin that is about to be (or already is) destroyed.
+            service.setPlugin(null);
+        }
         if (serviceBindingRequested) {
             try {
                 getContext().unbindService(serviceConnection);
@@ -568,8 +641,21 @@ public class MediaSessionPlugin extends Plugin {
             return null;
         }
         if (url.startsWith("data:")) {
+            // Honor MAX_ARTWORK_BYTES for embedded payloads too (the HTTP path already streams
+            // against the cap): first bound the URI STRING so the decode never materializes a
+            // grossly oversized buffer, then enforce the exact cap on the decoded bytes.
+            if (url.length() > DATA_URI_MAX_LENGTH) {
+                Log.w(TAG, "urlToArtworkData: data: URI longer than " + DATA_URI_MAX_LENGTH
+                        + " chars — refusing to decode");
+                return null;
+            }
             byte[] bytes = decodeDataUri(url);
             if (bytes == null) {
+                return null;
+            }
+            if (bytes.length > MAX_ARTWORK_BYTES) {
+                Log.w(TAG, "urlToArtworkData: data: payload exceeds " + MAX_ARTWORK_BYTES
+                        + " bytes — dropping");
                 return null;
             }
             return bytesToArtworkData(bytes, bytes.length);
@@ -637,7 +723,7 @@ public class MediaSessionPlugin extends Plugin {
      * {@code disconnect()}ed exactly once; the loop is capped at {@link #MAX_ARTWORK_REDIRECTS} hops and
      * a revisited URL aborts the loop. Runs on the artwork executor (off the bridge thread).
      */
-    private byte[] httpToArtworkData(String url) throws IOException {
+    byte[] httpToArtworkData(String url) throws IOException {
         String currentUrl = url;
         Set<String> visited = new HashSet<>();
         visited.add(url);
@@ -722,8 +808,30 @@ public class MediaSessionPlugin extends Plugin {
         return bitmapToArtworkData(bitmap);
     }
 
+    /**
+     * Extracts the {@link JSONObject} entries of an artwork array, dropping anything else
+     * (strings, numbers, booleans, nulls, nested arrays). A plain-JS caller can pass
+     * {@code artwork: ["cover.png"]}; {@code JSArray.toList()} would hand that String straight
+     * through its unchecked generic and the main-looper selector would then die with a
+     * {@code ClassCastException} — an app-killing crash from malformed input. Pure /
+     * package-private (unit-tested).
+     */
+    static List<JSONObject> jsonObjectEntries(org.json.JSONArray array) {
+        List<JSONObject> result = new ArrayList<>();
+        if (array == null) {
+            return result;
+        }
+        for (int i = 0; i < array.length(); i++) {
+            Object entry = array.opt(i);
+            if (entry instanceof JSONObject) {
+                result.add((JSONObject) entry);
+            }
+        }
+        return result;
+    }
+
     @PluginMethod
-    public void setMetadata(PluginCall call) throws JSONException {
+    public void setMetadata(PluginCall call) {
         // Text fields are applied synchronously on the bridge thread (current-field defaults).
         title = call.getString("title", title);
         artist = call.getString("artist", artist);
@@ -745,8 +853,9 @@ public class MediaSessionPlugin extends Plugin {
 
         // Select a single src (off-thread fetch) on the main looper so the
         // artworkData/artworkGeneration single-writer invariant holds. Resolve immediately on the
-        // bridge thread — the promise must NOT wait for the (possibly slow) network fetch.
-        final List<JSONObject> artworkList = artworkArray.toList();
+        // bridge thread — the promise must NOT wait for the (possibly slow) network fetch. Non-object
+        // entries are dropped here (defensively typed) rather than crashing the selector.
+        final List<JSONObject> artworkList = jsonObjectEntries(artworkArray);
         mainHandler.post(() -> {
             if (destroyed) {
                 // Plugin torn down between posting and running: do not touch the (released) player/state.
@@ -838,14 +947,24 @@ public class MediaSessionPlugin extends Plugin {
 
     @PluginMethod
     public void setPlaybackState(PluginCall call) {
+        final String newState = call.getString("playbackState");
+        if (!"none".equals(newState) && !"paused".equals(newState) && !"playing".equals(newState)) {
+            // Browsers throw a TypeError when an invalid value is assigned to
+            // navigator.mediaSession.playbackState; reject for cross-platform parity instead of
+            // silently caching garbage (which would tear the service down AND read back through
+            // getPlaybackState).
+            call.reject("playbackState must be one of 'none', 'paused' or 'playing'");
+            return;
+        }
+
         // playbackState is written on the bridge thread (read back by getPlaybackState there too).
-        playbackState = call.getString("playbackState", playbackState);
+        playbackState = newState;
 
         // Capture the bind decision input on the bridge thread, then hop to the main looper so the
         // service/serviceBindingRequested mutation stays main-looper-confined. resolve() does not
         // depend on the bind outcome, so it happens immediately on the bridge thread (the setMetadata
         // pattern).
-        final boolean playback = playbackState.equals("playing") || playbackState.equals("paused");
+        final boolean playback = newState.equals("playing") || newState.equals("paused");
         mainHandler.post(() -> applyPlaybackState(playback));
         call.resolve();
     }
@@ -1025,6 +1144,14 @@ public class MediaSessionPlugin extends Plugin {
      * also resolves {@code call} here (the bridge prologue intentionally did not).
      */
     private void applyActionHandler(String action, boolean remove, String label, String icon, String iconUri, boolean enabled, PluginCall call) {
+        if (destroyed) {
+            // Plugin torn down between the bridge-thread post and this main-looper run: release the
+            // kept-alive call (no tap can ever reach it) and touch no torn-down state.
+            if (!remove && call.isKeptAlive() && !call.isReleased()) {
+                call.release(getBridge());
+            }
+            return;
+        }
         final boolean custom = CustomActions.isCustom(action);
 
         // Always release any previously stored kept-alive call for this action before replacing or
@@ -1116,6 +1243,12 @@ public class MediaSessionPlugin extends Plugin {
      * released (e.g. handler just removed/re-registered).
      */
     public void actionCallback(String action, JSObject data) {
+        if (destroyed) {
+            // A late controller tap racing the teardown: the bridge/webview is going (or gone), so
+            // neither the kept-alive call nor the listener channel can deliver anything.
+            Log.w(TAG, "actionCallback DROPPED: plugin destroyed — ignoring '" + action + "'");
+            return;
+        }
         PluginCall call = actionHandlers.get(action);
         if (call != null
                 && !PluginCall.CALLBACK_ID_DANGLING.equals(call.getCallbackId())

@@ -3,7 +3,9 @@ package io.github.jofr.capacitor.mediasessionplugin;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import androidx.media3.common.C;
@@ -339,5 +341,95 @@ public class WebViewProxyPlayerTest {
 
         player.release();
         player.release();
+    }
+
+    // --- non-finite / non-representable time guards --------------------------------------------
+
+    @Test
+    public void infiniteDurationIsTreatedAsUnsetLikeALiveStream() {
+        // JS reports duration = Infinity for live streams; Math.round would saturate it to
+        // Long.MAX_VALUE and the microsecond conversion would overflow into a negative duration.
+        updateState("playing", Double.POSITIVE_INFINITY, 10.0, 1.0, ALL_ACTIONS);
+
+        assertEquals(C.TIME_UNSET, player.getDuration());
+        assertEquals(10_000L, player.getCurrentPosition());
+    }
+
+    @Test
+    public void nanDurationAndPositionFallBackSafely() {
+        updateState("playing", Double.NaN, Double.NaN, 1.0, ALL_ACTIONS);
+
+        assertEquals(C.TIME_UNSET, player.getDuration());
+        assertEquals(0L, player.getCurrentPosition());
+    }
+
+    @Test
+    public void hugeDurationDoesNotOverflowTheTimeline() {
+        updateState("playing", 1e16, 5.0, 1.0, ALL_ACTIONS);
+
+        // 1e16 seconds does not fit Media3's microsecond timeline; unset beats a negative duration.
+        assertEquals(C.TIME_UNSET, player.getDuration());
+    }
+
+    @Test
+    public void infinitePositionFallsBackToZero() {
+        updateState("playing", 100.0, Double.POSITIVE_INFINITY, 1.0, ALL_ACTIONS);
+
+        assertEquals(0L, player.getCurrentPosition());
+    }
+
+    @Test
+    public void nonFinitePlaybackRateFallsBackToNormalSpeed() {
+        updateState("playing", 100.0, 10.0, Double.POSITIVE_INFINITY, ALL_ACTIONS);
+        assertEquals(1.0f, player.getPlaybackParameters().speed, 0.0f);
+
+        updateState("playing", 100.0, 10.0, Double.NaN, ALL_ACTIONS);
+        assertEquals(1.0f, player.getPlaybackParameters().speed, 0.0f);
+    }
+
+    @Test
+    public void isRepresentableTimeGuardsTheExpectedRange() {
+        assertTrue(WebViewProxyPlayer.isRepresentableTime(1.0));
+        assertTrue(WebViewProxyPlayer.isRepresentableTime(86_400.0));
+        assertFalse(WebViewProxyPlayer.isRepresentableTime(0.0));
+        assertFalse(WebViewProxyPlayer.isRepresentableTime(-1.0));
+        assertFalse(WebViewProxyPlayer.isRepresentableTime(Double.NaN));
+        assertFalse(WebViewProxyPlayer.isRepresentableTime(Double.POSITIVE_INFINITY));
+        assertFalse(WebViewProxyPlayer.isRepresentableTime(WebViewProxyPlayer.MAX_REPRESENTABLE_TIME_SECONDS));
+    }
+
+    // --- MediaMetadata caching ------------------------------------------------------------------
+
+    @Test
+    public void positionOnlyUpdateReusesTheBuiltMediaMetadata() {
+        byte[] artwork = new byte[] { 1, 2, 3, 4 };
+        HashSet<String> actions = new HashSet<>(Arrays.asList(ALL_ACTIONS));
+        player.updateSessionState("playing", "T", "A", "AL", artwork, 100.0, 5.0, 1.0, actions);
+        MediaMetadata first = player.getMediaMetadata();
+
+        player.updateSessionState("paused", "T", "A", "AL", artwork, 100.0, 6.0, 1.5, actions);
+
+        // Steady-state position/state ticks must not rebuild the metadata (and re-clone the
+        // artwork bytes) — the cached instance is reused until a metadata input changes.
+        assertSame(first, player.getMediaMetadata());
+    }
+
+    @Test
+    public void metadataFieldChangeRebuildsMediaMetadata() {
+        HashSet<String> actions = new HashSet<>(Arrays.asList(ALL_ACTIONS));
+        byte[] artwork = new byte[] { 1, 2, 3, 4 };
+        player.updateSessionState("playing", "T", "A", "AL", artwork, 100.0, 5.0, 1.0, actions);
+        MediaMetadata first = player.getMediaMetadata();
+
+        player.updateSessionState("playing", "T2", "A", "AL", artwork, 100.0, 5.0, 1.0, actions);
+        MediaMetadata second = player.getMediaMetadata();
+        assertNotSame(first, second);
+        assertEquals("T2", String.valueOf(second.title));
+
+        byte[] newArtwork = new byte[] { 9, 9 };
+        player.updateSessionState("playing", "T2", "A", "AL", newArtwork, 100.0, 5.0, 1.0, actions);
+        MediaMetadata third = player.getMediaMetadata();
+        assertNotSame(second, third);
+        assertArrayEqualsCompat(newArtwork, third.artworkData);
     }
 }
