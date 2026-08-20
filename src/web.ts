@@ -24,6 +24,9 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
      * Media Session API exposes no readable position state and only a partial
      * metadata read). Metadata and position are MERGED on set so omitted fields
      * are preserved (mirroring the Android setters); playback state is assigned.
+     * The merged metadata/position caches are also what is handed to
+     * `navigator.mediaSession`, so the preserve-on-omit semantics hold for the
+     * browser-displayed state too, not just for the read-back getters.
      */
     private metadataCache: MetadataOptions = {};
     private playbackStateCache: MediaSessionPlaybackState = 'none';
@@ -32,7 +35,12 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
     async setMetadata(options: MetadataOptions): Promise<void> {
         this.metadataCache = { ...this.metadataCache, ...options };
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.metadata = new MediaMetadata(options);
+            // Hand the MERGED cache (not just the per-call fields) to the browser so
+            // omitted fields preserve their previous values, matching the Android
+            // setter semantics documented on `setMetadata`. A bare `new
+            // MediaMetadata(options)` would reset every omitted field to ''/[] here
+            // while Android keeps them.
+            navigator.mediaSession.metadata = new MediaMetadata(this.metadataCache);
             // Mirror the Android 'artworkload' outcome event: on Web the metadata
             // (incl. artwork) is handed off to navigator.mediaSession synchronously,
             // so report loaded:true with the first artwork src. Only fire when the
@@ -74,8 +82,14 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
                     handler === null
                         ? null
                         : (details: MediaSessionActionDetails) => {
-                              handler(this.toActionDetails(options.action, details));
-                              this.notifyListeners('action', this.toActionDetails(options.action, details));
+                              const mapped = this.toActionDetails(options.action, details);
+                              // try/finally so a throwing user handler cannot swallow the
+                              // 'action' event — Android likewise emits it unconditionally.
+                              try {
+                                  handler(mapped);
+                              } finally {
+                                  this.notifyListeners('action', mapped);
+                              }
                           };
                 navigator.mediaSession.setActionHandler(options.action as MediaSessionAction, wrapped);
             } catch (e) {
@@ -89,7 +103,11 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
     async setPositionState(options: PositionStateOptions): Promise<void> {
         this.positionStateCache = { ...this.positionStateCache, ...options };
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.setPositionState(options);
+            // Pass the MERGED cache so omitted fields preserve their previous values
+            // (the documented Android semantics). Passing the raw per-call options
+            // would make a position-only update throw a TypeError in browsers that
+            // require `duration` to be present alongside `position`.
+            navigator.mediaSession.setPositionState(this.positionStateCache);
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }
