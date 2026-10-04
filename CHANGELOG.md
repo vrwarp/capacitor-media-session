@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **Opt-in audio focus and phone-call interruptions (Android).** `setAudioFocusPolicy({ mode: 'owned' })` makes the plugin request Android audio focus when playback starts and report calls, other apps taking over and unplugged headphones through a new `interruption` event (`phase`, `reason`, `shouldResume`). During a call the proxy player reports a transient-focus-loss suppression, so the media notification and foreground service survive a long call; the end is reported only once the audio mode is back to normal. Default `'none'` keeps the previous behaviour. No new permission; Media3 stays at 1.4.1.
+
 ## 4.2.0
 
 Production-hardening release: test coverage, failure resilience, cross-platform parity and performance.

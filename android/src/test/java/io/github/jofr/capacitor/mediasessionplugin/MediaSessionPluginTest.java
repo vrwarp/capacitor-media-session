@@ -1857,4 +1857,81 @@ public class MediaSessionPluginTest {
         // A controller tap arriving after teardown must find no plugin to route into.
         assertNull(pluginField.get(service));
     }
+
+    private PluginCall mockPolicyCall(String mode) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString(eq("mode"), any())).thenReturn(mode);
+        when(call.getBoolean(eq("pauseWhenDucked"), any())).thenReturn(false);
+        return call;
+    }
+
+    private PluginCall mockStateCall(String state) {
+        PluginCall call = mock(PluginCall.class);
+        when(call.getString("playbackState")).thenReturn(state);
+        return call;
+    }
+
+    @Test
+    public void audioFocusPolicyDefaultsToNoneAndCreatesNoController() {
+        plugin.setPlaybackState(mockStateCall("playing"));
+        idleMainLooper();
+        assertNull(plugin.getAudioFocusController());
+    }
+
+    @Test
+    public void invalidAudioFocusModeIsRejected() {
+        PluginCall call = mockPolicyCall("bogus");
+        plugin.setAudioFocusPolicy(call);
+        verify(call).reject(anyString());
+    }
+
+    @Test
+    public void ownedPolicyTracksPlaybackStateAndSuppressionReachesThePlayer() {
+        plugin.setAudioFocusPolicy(mockPolicyCall("owned"));
+        idleMainLooper();
+        AudioFocusController controller = plugin.getAudioFocusController();
+        assertNotNull(controller);
+        assertTrue(controller.isOwned());
+
+        plugin.setPlaybackState(mockStateCall("playing"));
+        idleMainLooper();
+        assertTrue(controller.isFocusRegistered());
+
+        // A call takes focus: the session is suppressed, which the proxy player reports.
+        controller.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT);
+        plugin.setPlaybackState(mockStateCall("paused"));
+        idleMainLooper();
+        assertTrue(player.isInterrupted());
+        assertTrue(player.getPlayWhenReady());
+
+        // The call ends and JS restarts playback: suppression is released.
+        controller.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_GAIN);
+        plugin.setPlaybackState(mockStateCall("playing"));
+        idleMainLooper();
+        assertFalse(player.isInterrupted());
+
+        plugin.setAudioFocusPolicy(mockPolicyCall("none"));
+        idleMainLooper();
+        assertFalse(controller.isOwned());
+        assertFalse(controller.isFocusRegistered());
+    }
+
+    @Test
+    public void controllerPauseDuringInterruptionCancelsTheResume() {
+        plugin.setActionHandler(mockActionHandlerCall("play"));
+        plugin.setActionHandler(mockActionHandlerCall("pause"));
+        plugin.setAudioFocusPolicy(mockPolicyCall("owned"));
+        plugin.setPlaybackState(mockStateCall("playing"));
+        idleMainLooper();
+        AudioFocusController controller = plugin.getAudioFocusController();
+        controller.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT);
+        idleMainLooper();
+        assertTrue(player.isInterrupted());
+
+        // The notification shows "pause" while suppressed; tapping it means "don't resume".
+        player.pause();
+        idleMainLooper();
+        assertFalse(controller.isInterrupted());
+        assertFalse(player.isInterrupted());
+    }
 }

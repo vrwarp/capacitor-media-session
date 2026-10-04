@@ -282,6 +282,13 @@ describe('MediaSessionWeb', () => {
     });
   });
 
+  describe('setAudioFocusPolicy', () => {
+    it('is a resolved no-op on web (browsers own audio focus)', async () => {
+      await expect(plugin.setAudioFocusPolicy({ mode: 'owned' })).resolves.toBeUndefined();
+      await expect(plugin.setAudioFocusPolicy({ mode: 'none', pauseWhenDucked: true })).resolves.toBeUndefined();
+    });
+  });
+
   describe('getMetadata', () => {
     it('returns what was set, enriched from the live navigator metadata', async () => {
       await plugin.setMetadata({ title: 'Cached', artist: 'Cached Artist' });
