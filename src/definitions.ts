@@ -178,6 +178,52 @@ export interface SessionUnavailableEvent {
     reason: string;
 }
 
+/**
+ * Options for `setAudioFocusPolicy`.
+ */
+export interface AudioFocusPolicyOptions {
+    /**
+     * `'owned'`: the plugin requests Android audio focus whenever playback
+     * starts and reports interruptions (phone calls, another app taking over,
+     * headphones unplugged) through the `interruption` event. `'none'` (the
+     * default): no focus request, no events, behaviour unchanged.
+     *
+     * Only use `'owned'` when the WebView does not request focus for the same
+     * audio itself. An `<audio>`/`<video>` element does (Chromium requests focus
+     * for it), so the two requests would take focus from each other; Web Audio
+     * and native audio such as text-to-speech do not.
+     */
+    mode: 'owned' | 'none';
+    /**
+     * Treat "may duck" focus losses (notification sounds, navigation prompts)
+     * like a call and pause. Default `false`: Android ducks the app's own audio.
+     */
+    pauseWhenDucked?: boolean;
+}
+
+/**
+ * Payload of the `interruption` event (Android, policy `'owned'` only).
+ */
+export interface InterruptionEvent {
+    /** `'began'`: pause now. `'ended'`: the interruption is over. */
+    phase: 'began' | 'ended';
+    /**
+     * Why: `'transient'` (temporary focus loss, e.g. a call), `'call'` (the
+     * audio mode entered a call mode, Android 12+), `'delayed'` (playback was
+     * started during a call), `'loss'` (another app took over playback),
+     * `'noisy'` (the audio output went away, e.g. headphones unplugged),
+     * `'expired'` (the interruption lasted over 10 minutes), `'cancelled'`
+     * (the user paused from a media controller during the interruption).
+     */
+    reason: 'transient' | 'call' | 'delayed' | 'loss' | 'noisy' | 'expired' | 'cancelled';
+    /**
+     * On `'began'`: whether playback is expected to resume when it ends. On
+     * `'ended'`: whether to resume now (only if the user did not pause or start
+     * something else meanwhile — the app decides).
+     */
+    shouldResume: boolean;
+}
+
 export interface MediaSessionPlugin {
     /**
      * Sets metadata of the currently playing media. Analogue to setting the
@@ -332,6 +378,27 @@ export interface MediaSessionPlugin {
         eventName: 'sessionunavailable',
         listenerFunc: (event: SessionUnavailableEvent) => void,
     ): Promise<PluginListenerHandle>;
+    /**
+     * Listen for audio interruptions (Android, with `setAudioFocusPolicy({ mode: 'owned' })`).
+     *
+     * On `'began'` with `shouldResume: true` (a phone call), pause your audio
+     * and keep reporting `'paused'`: the plugin keeps the media notification and
+     * foreground service alive through the call. On `'ended'` with
+     * `shouldResume: true`, restart playback and report `'playing'`. The plugin
+     * waits until the phone is back in normal audio mode before sending it.
+     *
+     * Never fires on Web.
+     */
+    addListener(
+        eventName: 'interruption',
+        listenerFunc: (event: InterruptionEvent) => void,
+    ): Promise<PluginListenerHandle>;
+    /**
+     * Opt in to native Android audio focus, so phone calls and other apps can
+     * pause and resume your playback (see `addListener('interruption', ...)`).
+     * No-op on Web and iOS.
+     */
+    setAudioFocusPolicy(options: AudioFocusPolicyOptions): Promise<void>;
     /**
      * Update current media playback position, duration and speed. Analogue to
      * calling [setPositionState() of the MediaSession

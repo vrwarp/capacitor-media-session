@@ -72,6 +72,14 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
     private Set<String> supportedActions = new HashSet<>();
 
     /**
+     * Whether playback is suspended by an audio interruption (see {@link AudioFocusController}).
+     * While set, and the WebView state is not {@code none}, the player reports playWhenReady with
+     * {@link Player#PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS} — what ExoPlayer does
+     * during a call — so Media3 keeps the foreground service even though JavaScript has paused.
+     */
+    private boolean interrupted = false;
+
+    /**
      * Built {@link MediaMetadata} for the current title/artist/album/artwork, or {@code null} when
      * it must be rebuilt. {@link #getState()} runs on every state invalidation AND position tick;
      * without this cache each call re-built the metadata and re-cloned the artwork byte array
@@ -127,11 +135,28 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         invalidateState();
     }
 
+    /**
+     * Marks playback as suspended by (or released from) an audio interruption. Must be called on
+     * the main thread.
+     */
+    public void setInterrupted(boolean interrupted) {
+        if (this.interrupted == interrupted) {
+            return;
+        }
+        this.interrupted = interrupted;
+        invalidateState();
+    }
+
+    public boolean isInterrupted() {
+        return interrupted;
+    }
+
     @Override
     protected State getState() {
-        final boolean playing = playbackState.equals("playing");
+        final boolean suppressed = interrupted && !playbackState.equals("none");
+        final boolean playing = playbackState.equals("playing") && !suppressed;
         final boolean paused = playbackState.equals("paused");
-        final int media3PlaybackState = (playing || paused) ? Player.STATE_READY : Player.STATE_IDLE;
+        final int media3PlaybackState = (playing || paused || suppressed) ? Player.STATE_READY : Player.STATE_IDLE;
 
         final Player.Commands.Builder commands = new Player.Commands.Builder()
             .addAll(
@@ -215,7 +240,10 @@ public class WebViewProxyPlayer extends SimpleBasePlayer {
         return new State.Builder()
             .setAvailableCommands(commands.build())
             .setPlaybackState(media3PlaybackState)
-            .setPlayWhenReady(playing, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
+            .setPlayWhenReady(playing || suppressed, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
+            .setPlaybackSuppressionReason(suppressed
+                ? Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
+                : Player.PLAYBACK_SUPPRESSION_REASON_NONE)
             .setPlaylist(playlist)
             .setCurrentMediaItemIndex(currentItemIndex)
             .setContentPositionMs(positionSupplier)

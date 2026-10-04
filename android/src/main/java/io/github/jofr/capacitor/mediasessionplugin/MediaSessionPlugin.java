@@ -12,7 +12,9 @@ import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -127,6 +129,16 @@ public class MediaSessionPlugin extends Plugin {
     private final Map<String, CustomActionSpec> customActions = new LinkedHashMap<>();
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /**
+     * Opt-in Android audio focus (see {@link #setAudioFocusPolicy}). Created lazily on the main
+     * looper; main-looper-confined like {@link #service}.
+     */
+    @Nullable
+    private AudioFocusController audioFocusController = null;
+
+    /** Whether the audio-focus controller currently suppresses playback (main-looper-confined). */
+    private boolean audioInterrupted = false;
 
     /**
      * Set once in {@link #handleOnDestroy}. Read on the main looper by late artwork-delivery and
@@ -406,6 +418,7 @@ public class MediaSessionPlugin extends Plugin {
                     + playbackState + ", title='" + title + "')");
             return;
         }
+        player.setInterrupted(audioInterrupted);
         player.updateSessionState(
             playbackState,
             title,
@@ -965,7 +978,12 @@ public class MediaSessionPlugin extends Plugin {
         // depend on the bind outcome, so it happens immediately on the bridge thread (the setMetadata
         // pattern).
         final boolean playback = newState.equals("playing") || newState.equals("paused");
-        mainHandler.post(() -> applyPlaybackState(playback));
+        mainHandler.post(() -> {
+            if (audioFocusController != null && !destroyed) {
+                audioFocusController.onJsPlaybackState(newState);
+            }
+            applyPlaybackState(playback);
+        });
         call.resolve();
     }
 
@@ -1030,6 +1048,74 @@ public class MediaSessionPlugin extends Plugin {
             mainHandler.removeCallbacks(pendingServiceTeardown);
             pendingServiceTeardown = null;
         }
+    }
+
+    /**
+     * Opts in to (or out of) native Android audio focus. With {@code mode: 'owned'} the plugin
+     * requests focus whenever playback starts and reports phone calls and other interruptions
+     * through the {@code interruption} event (see {@link AudioFocusController}). Only use it when
+     * the WebView does not request focus for the same audio itself (an {@code <audio>} element
+     * does; Web Audio and native TTS do not), otherwise the two requests take focus from each
+     * other. Default {@code 'none'}: no focus request, behaviour unchanged.
+     */
+    @PluginMethod
+    public void setAudioFocusPolicy(PluginCall call) {
+        final String mode = call.getString("mode", "none");
+        if (!"owned".equals(mode) && !"none".equals(mode)) {
+            call.reject("mode must be 'owned' or 'none'");
+            return;
+        }
+        final boolean pauseWhenDucked = Boolean.TRUE.equals(call.getBoolean("pauseWhenDucked", false));
+        final String currentState = playbackState;
+        mainHandler.post(() -> {
+            if (destroyed) {
+                return;
+            }
+            boolean owned = "owned".equals(mode);
+            if (audioFocusController == null) {
+                if (!owned) {
+                    return;
+                }
+                audioFocusController = new AudioFocusController(getContext(), mainHandler, audioFocusListener);
+                audioFocusController.onJsPlaybackState(currentState);
+            }
+            audioFocusController.setPolicy(owned, pauseWhenDucked);
+        });
+        call.resolve();
+    }
+
+    private final AudioFocusController.Listener audioFocusListener = new AudioFocusController.Listener() {
+        @Override
+        public void onInterruption(@NonNull String phase, @NonNull String reason, boolean shouldResume) {
+            Log.i(TAG, "interruption " + phase + " reason=" + reason + " shouldResume=" + shouldResume);
+            JSObject event = new JSObject();
+            event.put("phase", phase);
+            event.put("reason", reason);
+            event.put("shouldResume", shouldResume);
+            notifyListeners("interruption", event);
+        }
+
+        @Override
+        public void onSuppressionChanged(boolean suppressed) {
+            audioInterrupted = suppressed;
+            pushPlayerState();
+        }
+    };
+
+    @VisibleForTesting
+    @Nullable
+    AudioFocusController getAudioFocusController() {
+        return audioFocusController;
+    }
+
+    @VisibleForTesting
+    void setAudioFocusControllerForTesting(@Nullable AudioFocusController controller) {
+        audioFocusController = controller;
+    }
+
+    @VisibleForTesting
+    AudioFocusController.Listener getAudioFocusListenerForTesting() {
+        return audioFocusListener;
     }
 
     @PluginMethod
@@ -1221,6 +1307,10 @@ public class MediaSessionPlugin extends Plugin {
     }
 
     private void onPlayerAction(String action, Double seekTime, Double seekOffset) {
+        if ("pause".equals(action) && audioFocusController != null) {
+            // A pause from the notification/lock screen/headset during a call means "don't resume".
+            audioFocusController.onControllerPause();
+        }
         JSObject data = new JSObject();
         if (seekTime != null) {
             data.put("seekTime", seekTime);
@@ -1282,6 +1372,11 @@ public class MediaSessionPlugin extends Plugin {
         // touching the released player/state. Then clear pending main-looper callbacks BEFORE
         // shutting down the artwork executor / stopping the service, so nothing re-posts afterwards.
         destroyed = true;
+        if (audioFocusController != null) {
+            // Gives focus back and unregisters the receivers before the WebView goes away; nothing
+            // could resume playback afterwards.
+            audioFocusController.release();
+        }
         mainHandler.removeCallbacksAndMessages(null);
         // Defensive: removeCallbacksAndMessages(null) already dropped the posted teardown, but clear
         // the field too so nothing references a stale runnable. Teardown is never deferred on destroy.

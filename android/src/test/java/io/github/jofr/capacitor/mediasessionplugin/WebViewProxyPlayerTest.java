@@ -94,6 +94,33 @@ public class WebViewProxyPlayerTest {
     }
 
     @Test
+    public void interruptedPausedReportsSuppressedPlayWhenReady() {
+        updateState("playing", ALL_ACTIONS);
+        player.setInterrupted(true);
+        updateState("paused", ALL_ACTIONS);
+
+        // What ExoPlayer reports during a call: still "wants to play", suppressed by focus loss,
+        // so Media3 keeps the foreground service.
+        assertEquals(Player.STATE_READY, player.getPlaybackState());
+        assertTrue(player.getPlayWhenReady());
+        assertEquals(Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS,
+                player.getPlaybackSuppressionReason());
+        assertFalse(player.isPlaying());
+
+        player.setInterrupted(false);
+        assertFalse(player.getPlayWhenReady());
+        assertEquals(Player.PLAYBACK_SUPPRESSION_REASON_NONE, player.getPlaybackSuppressionReason());
+    }
+
+    @Test
+    public void interruptedWithNoneStateStaysIdle() {
+        player.setInterrupted(true);
+        updateState("none", ALL_ACTIONS);
+        assertEquals(Player.STATE_IDLE, player.getPlaybackState());
+        assertFalse(player.getPlayWhenReady());
+    }
+
+    @Test
     public void noneStateMapsToIdle() {
         updateState("playing", ALL_ACTIONS);
         updateState("none", ALL_ACTIONS);

@@ -1,6 +1,6 @@
 import { WebPlugin } from '@capacitor/core';
 
-import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, ActionHandler, ActionDetails, PositionStateOptions, MediaSessionPlugin, MediaSessionPlaybackState, MediaSessionAction } from './definitions';
+import type { MetadataOptions, PlaybackStateOptions, ActionHandlerOptions, ActionHandler, ActionDetails, PositionStateOptions, MediaSessionPlugin, MediaSessionPlaybackState, MediaSessionAction, AudioFocusPolicyOptions } from './definitions';
 
 /**
  * The eight actions defined by the Media Session Web API. Any other action
@@ -139,6 +139,11 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
 
     async getPositionState(): Promise<PositionStateOptions> {
         return { ...this.positionStateCache };
+    }
+
+    /** Android only: browsers manage audio focus themselves. */
+    async setAudioFocusPolicy(_options: AudioFocusPolicyOptions): Promise<void> {
+        return;
     }
 
     /** Maps navigator's MediaSessionActionDetails to our ActionDetails shape. */

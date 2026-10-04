@@ -185,6 +185,11 @@ public class MediaSessionService extends androidx.media3.session.MediaSessionSer
         return new MediaSession.Builder(this, player)
                 .setId(sessionId)
                 .setCallback(sessionCallback)
+                // While an audio interruption (a phone call) suppresses playback, keep reporting
+                // PLAYING to the system rather than PAUSED, so the platform's inactive-media timer
+                // does not reclaim the session during a long call. The only suppression this
+                // player ever reports is the plugin's opt-in audio-focus interruption.
+                .setShowPlayButtonIfPlaybackIsSuppressed(false)
                 .build();
     }
 
