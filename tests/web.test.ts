@@ -97,7 +97,11 @@ describe('MediaSessionWeb', () => {
       const listener = vi.fn();
       await plugin.addListener('artworkload', listener);
 
-      await plugin.setMetadata({ artist: 'Artist', title: undefined, artwork: undefined });
+      await plugin.setMetadata({
+        artist: 'Artist',
+        title: undefined,
+        artwork: undefined,
+      });
 
       expect(fake.metadata?.title).toBe('Song');
       expect(fake.metadata?.artwork).toEqual([{ src: 'cover.png' }]);
@@ -354,9 +358,9 @@ describe('MediaSessionWeb', () => {
       await plugin.setPositionState({ duration: 300, position: 10 });
 
       // position > duration: the browser throws a TypeError.
-      await expect(
-        plugin.setPositionState({ position: 999 }),
-      ).rejects.toThrow(TypeError);
+      await expect(plugin.setPositionState({ position: 999 })).rejects.toThrow(
+        TypeError,
+      );
       expect(await plugin.getPositionState()).toEqual({
         duration: 300,
         position: 10,
@@ -384,8 +388,12 @@ describe('MediaSessionWeb', () => {
 
   describe('setAudioFocusPolicy', () => {
     it('is a resolved no-op on web (browsers own audio focus)', async () => {
-      await expect(plugin.setAudioFocusPolicy({ mode: 'owned' })).resolves.toBeUndefined();
-      await expect(plugin.setAudioFocusPolicy({ mode: 'none', pauseWhenDucked: true })).resolves.toBeUndefined();
+      await expect(
+        plugin.setAudioFocusPolicy({ mode: 'owned' }),
+      ).resolves.toBeUndefined();
+      await expect(
+        plugin.setAudioFocusPolicy({ mode: 'none', pauseWhenDucked: true }),
+      ).resolves.toBeUndefined();
     });
   });
 
