@@ -88,9 +88,12 @@ public class MediaSessionPlugin extends Plugin {
 
     private boolean startServiceOnlyDuringPlayback = true;
 
-    private String title = "";
-    private String artist = "";
-    private String album = "";
+    // Session state written on the bridge thread and read on the main looper by pushPlayerState();
+    // volatile so a push triggered from the main looper itself (audio-focus change, late artwork
+    // result) never sees a stale value.
+    private volatile String title = "";
+    private volatile String artist = "";
+    private volatile String album = "";
     /**
      * Raw artwork array exactly as supplied to {@link #setMetadata} (a {@link JSArray}, which extends
      * {@code org.json.JSONArray}). BRIDGE-THREAD-CONFINED: written in {@link #setMetadata} and read in
@@ -105,10 +108,10 @@ public class MediaSessionPlugin extends Plugin {
      * {@code volatile}.
      */
     private volatile byte[] artworkData = null;
-    private String playbackState = "none";
-    private double duration = 0.0;
-    private double position = 0.0;
-    private double playbackRate = 1.0;
+    private volatile String playbackState = "none";
+    private volatile double duration = 0.0;
+    private volatile double position = 0.0;
+    private volatile double playbackRate = 1.0;
     /**
      * Registered action handlers (action -> kept-alive {@code RETURN_CALLBACK} {@link PluginCall}).
      * MAIN-LOOPER-CONFINED: every read and write happens on the main looper. Writers (registration /
