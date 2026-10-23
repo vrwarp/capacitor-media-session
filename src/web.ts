@@ -81,7 +81,7 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         // Cache only after the browser accepted the value, so a rejected state is
         // never reported back by `getPlaybackState`.
         this.playbackStateCache = options.playbackState;
-    };
+    }
 
     async setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void> {
         if (!STANDARD_ACTIONS.has(options.action)) {
@@ -116,7 +116,7 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }
-    };
+    }
 
     async setPositionState(options: PositionStateOptions): Promise<void> {
         if (!('mediaSession' in navigator)) {
@@ -131,7 +131,7 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         const merged = mergeDefined(this.positionStateCache, options);
         navigator.mediaSession.setPositionState(merged);
         this.positionStateCache = merged;
-    };
+    }
 
     async getMetadata(): Promise<MetadataOptions> {
         // Start from our own cache, then enrich from navigator.mediaSession's
