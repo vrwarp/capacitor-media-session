@@ -35,7 +35,8 @@ __There is one notable difference compared to the Web API__: You have to explici
 * **Standard Media Session actions** — `play`, `pause`, `seekto`, `seekforward`, `seekbackward`, `previoustrack`, `nexttrack` and `stop`, plus **arbitrary custom actions** (Android) registered with any non-standard action string.
 * **Custom action options** (Android) — `label`, `icon` (built-in Media3 icons), `iconUri` (a custom drawable URI) and `enabled` per custom-action button.
 * **Read-back getters** — `getMetadata()`, `getPlaybackState()` and `getPositionState()` return the last values you set from the plugin's own cache.
-* **Listeners** — `addListener('action', …)` fires for every action (standard *and* custom, including the `data` payload), and `addListener('artworkload', …)` reports the artwork load outcome.
+* **Listeners** — `addListener('action', …)` fires for every action (standard *and* custom, including the `data` payload), `addListener('artworkload', …)` reports the artwork load outcome, `addListener('sessionunavailable', …)` reports (Android) that the media session could not be created, and `addListener('interruption', …)` reports phone calls and other audio interruptions (see below).
+* **Audio focus and phone calls** (Android, opt-in) — `setAudioFocusPolicy({ mode: 'owned' })` pauses/resumes your audio around calls and other apps; see [Phone calls and other interruptions](#phone-calls-and-other-interruptions-android).
 * **Async, size-aware artwork** — `http(s)://` and `data:` URIs; a single best-fit image is selected by size, downsampled and capped at 8&nbsp;MB; `http <-> https` cross-protocol redirects are followed (bounded hop count).
 * **Service lifecycle config** — the Android `foregroundService` key chooses `'always'` (started at load) vs. during-playback only.
 * **Graceful Web/iOS degradation** — Web and iOS map onto `navigator.mediaSession`; custom actions are a silent no-op there.

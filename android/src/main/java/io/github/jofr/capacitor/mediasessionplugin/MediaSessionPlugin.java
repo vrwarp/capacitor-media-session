@@ -1305,7 +1305,7 @@ public class MediaSessionPlugin extends Plugin {
     public boolean hasActionHandler(String action) {
         PluginCall call = actionHandlers.get(action);
         return call != null
-                && !call.getCallbackId().equals(PluginCall.CALLBACK_ID_DANGLING)
+                && !PluginCall.CALLBACK_ID_DANGLING.equals(call.getCallbackId())
                 && !call.isReleased();
     }
 
