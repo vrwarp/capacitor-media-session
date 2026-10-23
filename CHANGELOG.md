@@ -33,7 +33,7 @@ Production-hardening release: test coverage, failure resilience, cross-platform 
 
 * **The TypeScript layer is now unit-tested** (previously zero direct coverage — the example suite mocks the plugin away): a root vitest + jsdom harness with a spec-faithful `navigator.mediaSession`/`MediaMetadata` fake covers 100% of `src/web.ts` and the `src/index.ts` proxy, including the `removeHandler` translation, event wrapping and every unavailable/error path. Run with `npm test` (also `test:watch`, `test:coverage`).
 * **Android suite grew from 160 to 195 tests.** The artwork HTTP fetch loop — previously untested at the socket level by design — is now driven over real loopback sockets by a minimal hand-rolled server (`java.net` only, no new dependency): terminal 200 + downsampling, relative/absolute redirect chains, the redirect hop-cap boundary (5 follows succeed, 6 abort), the redirect-loop visited-set guard, non-200 responses, the `Content-Length` fast-fail, the streaming byte-cap abort, and connection failures. New regression tests cover every fix above.
-* **CI runs the web unit tests** (`verify:web` = build + test), and publishing (`prepublishOnly`) is gated on them too.
+* **CI runs the web unit tests** (`verify:web` = build + test), and the tag-triggered publish workflow runs them before `npm publish`.
 
 ### Also in this release (previously unreleased)
 

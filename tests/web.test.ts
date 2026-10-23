@@ -89,6 +89,54 @@ describe('MediaSessionWeb', () => {
       expect(listener).not.toHaveBeenCalled();
     });
 
+    it('treats explicitly undefined fields as omitted (preserves the previous values)', async () => {
+      await plugin.setMetadata({
+        title: 'Song',
+        artwork: [{ src: 'cover.png' }],
+      });
+      const listener = vi.fn();
+      await plugin.addListener('artworkload', listener);
+
+      await plugin.setMetadata({
+        artist: 'Artist',
+        title: undefined,
+        artwork: undefined,
+      });
+
+      expect(fake.metadata?.title).toBe('Song');
+      expect(fake.metadata?.artwork).toEqual([{ src: 'cover.png' }]);
+      expect(await plugin.getMetadata()).toEqual({
+        title: 'Song',
+        artist: 'Artist',
+        artwork: [{ src: 'cover.png' }],
+      });
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it('does not cache metadata the browser rejected (no poisoned merges)', async () => {
+      await plugin.setMetadata({ title: 'Song' });
+      const RealMediaMetadata = (globalThis as any).MediaMetadata;
+      (globalThis as any).MediaMetadata = class {
+        constructor(init: { artwork?: { src: string }[] }) {
+          if (init.artwork?.some(a => a.src === 'bad')) {
+            throw new TypeError('Invalid artwork URL');
+          }
+          return new RealMediaMetadata(init);
+        }
+      };
+
+      await expect(
+        plugin.setMetadata({ artwork: [{ src: 'bad' }] }),
+      ).rejects.toThrow(TypeError);
+      expect(await plugin.getMetadata()).toEqual({ title: 'Song' });
+
+      // A later valid update must not be blocked by the rejected artwork.
+      await expect(
+        plugin.setMetadata({ artist: 'Artist' }),
+      ).resolves.toBeUndefined();
+      expect(fake.metadata?.artist).toBe('Artist');
+    });
+
     it('rejects with an unavailable error when the Media Session API is missing', async () => {
       uninstallFakeMediaSession();
 
@@ -112,6 +160,18 @@ describe('MediaSessionWeb', () => {
       await expect(
         plugin.setPlaybackState({ playbackState: 'bogus' as never }),
       ).rejects.toThrow(TypeError);
+    });
+
+    it('does not cache a playback state the browser rejected', async () => {
+      await plugin.setPlaybackState({ playbackState: 'playing' });
+
+      await expect(
+        plugin.setPlaybackState({ playbackState: 'bogus' as never }),
+      ).rejects.toThrow(TypeError);
+
+      expect(await plugin.getPlaybackState()).toEqual({
+        playbackState: 'playing',
+      });
     });
 
     it('falls back to navigator.mediaSession.playbackState when nothing was set', async () => {
@@ -269,6 +329,50 @@ describe('MediaSessionWeb', () => {
       });
     });
 
+    it('treats explicitly undefined fields as omitted (preserves the previous values)', async () => {
+      await plugin.setPositionState({
+        duration: 300,
+        position: 0,
+        playbackRate: 1,
+      });
+
+      await plugin.setPositionState({
+        duration: undefined,
+        position: 40,
+        playbackRate: undefined,
+      });
+
+      expect(fake.positionState).toEqual({
+        duration: 300,
+        position: 40,
+        playbackRate: 1,
+      });
+      expect(await plugin.getPositionState()).toEqual({
+        duration: 300,
+        position: 40,
+        playbackRate: 1,
+      });
+    });
+
+    it('does not cache a position state the browser rejected', async () => {
+      await plugin.setPositionState({ duration: 300, position: 10 });
+
+      // position > duration: the browser throws a TypeError.
+      await expect(plugin.setPositionState({ position: 999 })).rejects.toThrow(
+        TypeError,
+      );
+      expect(await plugin.getPositionState()).toEqual({
+        duration: 300,
+        position: 10,
+      });
+
+      // The next valid position-only update still merges with the good state.
+      await expect(
+        plugin.setPositionState({ position: 20 }),
+      ).resolves.toBeUndefined();
+      expect(fake.positionState).toEqual({ duration: 300, position: 20 });
+    });
+
     it('returns an empty object before any position state was set', async () => {
       expect(await plugin.getPositionState()).toEqual({});
     });
@@ -284,8 +388,12 @@ describe('MediaSessionWeb', () => {
 
   describe('setAudioFocusPolicy', () => {
     it('is a resolved no-op on web (browsers own audio focus)', async () => {
-      await expect(plugin.setAudioFocusPolicy({ mode: 'owned' })).resolves.toBeUndefined();
-      await expect(plugin.setAudioFocusPolicy({ mode: 'none', pauseWhenDucked: true })).resolves.toBeUndefined();
+      await expect(
+        plugin.setAudioFocusPolicy({ mode: 'owned' }),
+      ).resolves.toBeUndefined();
+      await expect(
+        plugin.setAudioFocusPolicy({ mode: 'none', pauseWhenDucked: true }),
+      ).resolves.toBeUndefined();
     });
   });
 

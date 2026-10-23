@@ -18,6 +18,21 @@ const STANDARD_ACTIONS: ReadonlySet<string> = new Set([
     'stop',
 ]);
 
+/**
+ * Shallow merge that ignores keys whose value is `undefined`. A plain spread
+ * would let an explicit `{ artwork: undefined }` erase the cached value, whereas
+ * the native bridge drops `undefined` (so the field is "omitted" and preserved).
+ */
+function mergeDefined<T extends MetadataOptions | PositionStateOptions>(base: T, update: T): T {
+    const result: T = { ...base };
+    for (const key of Object.keys(update) as (keyof T)[]) {
+        if (update[key] !== undefined) {
+            result[key] = update[key];
+        }
+    }
+    return result;
+}
+
 export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
     /**
      * Cached last-set values so the getters can read back what was set (the Web
@@ -33,37 +48,40 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
     private positionStateCache: PositionStateOptions = {};
 
     async setMetadata(options: MetadataOptions): Promise<void> {
-        this.metadataCache = { ...this.metadataCache, ...options };
-        if ('mediaSession' in navigator) {
-            // Hand the MERGED cache (not just the per-call fields) to the browser so
-            // omitted fields preserve their previous values, matching the Android
-            // setter semantics documented on `setMetadata`. A bare `new
-            // MediaMetadata(options)` would reset every omitted field to ''/[] here
-            // while Android keeps them.
-            navigator.mediaSession.metadata = new MediaMetadata(this.metadataCache);
-            // Mirror the Android 'artworkload' outcome event: on Web the metadata
-            // (incl. artwork) is handed off to navigator.mediaSession synchronously,
-            // so report loaded:true with the first artwork src. Only fire when the
-            // caller actually supplied an artwork array (omitting it preserves the
-            // previous cover and emits nothing, matching Android).
-            if ('artwork' in options) {
-                const src =
-                    options.artwork && options.artwork.length > 0 ? options.artwork[0].src : undefined;
-                this.notifyListeners('artworkload', { loaded: true, src });
-            }
-        } else {
+        if (!('mediaSession' in navigator)) {
             throw this.unavailable('Media Session API not available in this browser.');
+        }
+        // Hand the MERGED metadata (not just the per-call fields) to the browser so
+        // omitted fields preserve their previous values, matching the Android
+        // setter semantics documented on `setMetadata`. A bare `new
+        // MediaMetadata(options)` would reset every omitted field to ''/[] here
+        // while Android keeps them. The cache is only committed after the browser
+        // accepted the value: `MediaMetadata` throws a TypeError for e.g. an
+        // unparsable artwork `src`, and caching it first would poison every later
+        // merge (and the read-back getter) with the rejected value.
+        const merged = mergeDefined(this.metadataCache, options);
+        navigator.mediaSession.metadata = new MediaMetadata(merged);
+        this.metadataCache = merged;
+        // Mirror the Android 'artworkload' outcome event: on Web the metadata
+        // (incl. artwork) is handed off to navigator.mediaSession synchronously,
+        // so report loaded:true with the first artwork src. Only fire when the
+        // caller actually supplied an artwork array (omitting it preserves the
+        // previous cover and emits nothing, matching Android).
+        if (options.artwork !== undefined) {
+            const src = options.artwork.length > 0 ? options.artwork[0].src : undefined;
+            this.notifyListeners('artworkload', { loaded: true, src });
         }
     }
 
     async setPlaybackState(options: PlaybackStateOptions): Promise<void> {
-        this.playbackStateCache = options.playbackState;
-        if ('mediaSession' in navigator) {
-            navigator.mediaSession.playbackState = options.playbackState;
-        } else {
+        if (!('mediaSession' in navigator)) {
             throw this.unavailable('Media Session API not available in this browser.');
         }
-    };
+        navigator.mediaSession.playbackState = options.playbackState;
+        // Cache only after the browser accepted the value, so a rejected state is
+        // never reported back by `getPlaybackState`.
+        this.playbackStateCache = options.playbackState;
+    }
 
     async setActionHandler(options: ActionHandlerOptions, handler: ActionHandler | null): Promise<void> {
         if (!STANDARD_ACTIONS.has(options.action)) {
@@ -98,20 +116,22 @@ export class MediaSessionWeb extends WebPlugin implements MediaSessionPlugin {
         } else {
             throw this.unavailable('Media Session API not available in this browser.');
         }
-    };
+    }
 
     async setPositionState(options: PositionStateOptions): Promise<void> {
-        this.positionStateCache = { ...this.positionStateCache, ...options };
-        if ('mediaSession' in navigator) {
-            // Pass the MERGED cache so omitted fields preserve their previous values
-            // (the documented Android semantics). Passing the raw per-call options
-            // would make a position-only update throw a TypeError in browsers that
-            // require `duration` to be present alongside `position`.
-            navigator.mediaSession.setPositionState(this.positionStateCache);
-        } else {
+        if (!('mediaSession' in navigator)) {
             throw this.unavailable('Media Session API not available in this browser.');
         }
-    };
+        // Pass the MERGED state so omitted fields preserve their previous values
+        // (the documented Android semantics). Passing the raw per-call options
+        // would make a position-only update throw a TypeError in browsers that
+        // require `duration` to be present alongside `position`. Commit to the
+        // cache only after the browser accepted it (it throws a TypeError for e.g.
+        // `position > duration`), so a rejected update cannot poison later merges.
+        const merged = mergeDefined(this.positionStateCache, options);
+        navigator.mediaSession.setPositionState(merged);
+        this.positionStateCache = merged;
+    }
 
     async getMetadata(): Promise<MetadataOptions> {
         // Start from our own cache, then enrich from navigator.mediaSession's
